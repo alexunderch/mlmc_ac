@@ -37,15 +37,9 @@ EXPOSE 9999
 WORKDIR /home/workdir
 
 COPY ./requirements.txt .
-RUN pip install tensorflow[and-cuda]==2.14
-RUN pip uninstall -y tensorflow
 
 RUN pip install -r requirements.txt --ignore-installed
-
-#installing minigrid
-# RUN pip install "xminigrid @ git+https://github.com/corl-team/xland-minigrid.git"
-# install jax
-
+RUN pip install tensorflow[and-cuda]==2.14
 RUN pip install --upgrade jax==0.4.25 jaxlib[cuda11_pip]==0.4.25 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 RUN git config --global --add safe.directory /home/workdir
