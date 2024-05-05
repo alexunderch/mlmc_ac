@@ -1,0 +1,10 @@
+jax
+chex
+distrax
+flax
+optax
+gymnax
+pandas
+wheel
+wandb
+pogema
