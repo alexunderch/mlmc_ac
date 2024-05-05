@@ -1,0 +1,27 @@
+type: td0
+seed: 0
+actor_optimiser: adam
+critic_optimiser: adam
+
+momentum:
+  decay_theta: 0.87
+  decay_eta: 3.2
+  decay_beta: 0.15
+  decay_p: 0.48
+
+learning_rate: 1.E-3
+
+experiment:
+  env_id: CartPole-v1
+  n_training_episodes: 500
+  batchsize_bound: 2
+  max_t: 500
+  batchsize_limit: 4
+  gamma: 0.99
+  mlmc_correction_actor: false
+  mlmc_correction_critic: false
+
+wandb:
+  project: MLMCOptimiser 
+  # name: actor_critic_montecarlo
+  entity: alexunderch

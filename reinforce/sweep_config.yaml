@@ -1,0 +1,22 @@
+program: experiment.py
+
+method: grid
+metric:
+  goal: maximize
+  name: Average_reward
+
+parameters:
+  experiment.env_id:
+    values: [CartPole-v1, Acrobot-v1]
+  optimiser:
+    values: [adagrad, sgd]
+  experiment.mlmc_correction:
+    values: [true, false]
+  seed:
+    values: [1, 11, 111]
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- ${args_no_hyphens}
