@@ -4,6 +4,7 @@ distrax
 flax
 optax
 gymnax
+hydra-core
 pandas
 wheel
 wandb
