@@ -1,16 +1,17 @@
-program: experiment.py
-
+program: experiment_disc.py
 
 method: grid
 metric:
   goal: maximize
-  name: Average_reward
+  name: Episode_Return
 
 parameters:
+  type: 
+    values: ["mc", "td0"]
   experiment.env_id:
     values: [CartPole-v1, Acrobot-v1]
   critic_optimiser:
-    values: [adam, adagrad, sgd]
+    values: [adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
   actor_optimiser:
     values: [adam, adagrad, sgd]
   experiment.mlmc_correction_actor:

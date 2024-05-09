@@ -4,7 +4,7 @@ program: experiment_ppo.py
 method: grid
 metric:
   goal: maximize
-  name: Average_reward
+  name: Episode_Return
 
 parameters:
   experiment.env_id:

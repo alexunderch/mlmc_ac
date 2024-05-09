@@ -6,7 +6,7 @@ GPUS=
 endif
 
 # Set flag for docker run command
-BASE_FLAGS=-itd --rm  -v ${PWD}:/home/workdir --shm-size 20G --name ${USER}.cleanrl_dreamer
+BASE_FLAGS=-itd --rm  -v ${PWD}:/home/workdir --shm-size 20G --name ${USER}.mlmc4rl
 RUN_FLAGS=$(GPUS) $(BASE_FLAGS)
 
 DOCKER_IMAGE_NAME = dreamercleanrl

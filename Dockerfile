@@ -40,7 +40,7 @@ COPY ./requirements.txt .
 
 RUN pip install -r requirements.txt --ignore-installed
 RUN pip install tensorflow[and-cuda]==2.14
-RUN pip install --upgrade jax==0.4.25 jaxlib[cuda11_pip]==0.4.25 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+RUN pip install --upgrade jax==0.4.25 jaxlib==0.4.25+cuda11.cudnn86 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
 RUN git config --global --add safe.directory /home/workdir
 CMD ["/bin/bash"]

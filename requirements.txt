@@ -9,3 +9,4 @@ pandas
 wheel
 wandb
 pogema
+pydantic==1.9.1

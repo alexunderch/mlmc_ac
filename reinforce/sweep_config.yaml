@@ -9,7 +9,7 @@ parameters:
   experiment.env_id:
     values: [CartPole-v1, Acrobot-v1]
   optimiser:
-    values: [adagrad, sgd]
+    values: [adagrad, sgd, adam]
   experiment.mlmc_correction:
     values: [true, false]
   seed:
