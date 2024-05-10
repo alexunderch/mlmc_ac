@@ -12,7 +12,7 @@ learning_rate: 3.E-4
 
 experiment:
   env_id: pogema
-  n_training_episodes: 5000
+  n_training_episodes: 15000
   batchsize_bound: 4
   max_t: 500
   batchsize_limit: 16
@@ -23,7 +23,8 @@ experiment:
     size: 8  # size of the grid
     density: 0.0  # obstacle density
     max_episode_steps: 64  # horizon
-    obs_radius: 2  # defines field of view
+    obs_radius: 1  # defines field of view
+    map_name: 'Easy8x8'
 
 wandb:
   project: MLMCOptimiser 

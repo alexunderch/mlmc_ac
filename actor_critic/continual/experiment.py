@@ -13,9 +13,6 @@ import numpy as np
 import optax
 import optax._src.base as base
 import optax._src.utils as utils
-import pandas as pd
-import pogema
-import pogema.envs
 from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
@@ -23,6 +20,9 @@ from flax.training.train_state import TrainState
 from optax import scale_by_learning_rate
 from optax._src.numerics import abs_sq as _abs_sq
 from optax.tree_utils import tree_add
+from pogema.envs import _make_pogema
+from pogema.grid_config import GridConfig
+from pogema.integrations.sample_factory import AutoResetWrapper
 
 warnings.filterwarnings("ignore")
 
@@ -31,6 +31,8 @@ import gymnax.wrappers
 import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
+
+DEBUG_POGEMA = True
 
 
 def isr_decay(initial_value: float) -> base.Schedule:
@@ -147,8 +149,15 @@ def run_actorcritic_experiment_td0(
 
     else:
 
-        config = pogema.GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
-        env = pogema.envs._make_pogema(config)
+        config = GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
+        env = _make_pogema(config)
+        env = AutoResetWrapper(env)
+
+        if DEBUG_POGEMA:
+            import pogema.animation
+
+            env = pogema.animation.AnimationMonitor(env)
+
         env_params = None
 
         @dataclass
@@ -180,7 +189,7 @@ def run_actorcritic_experiment_td0(
             return jnp.array(observation[0]).reshape(-1)
 
         def jit_reset(*args):
-            reset_shape = jax.ShapeDtypeStruct((75,), jnp.float32)
+            reset_shape = jax.ShapeDtypeStruct((27,), jnp.float32)
             return jax.pure_callback(callback_reset, reset_shape, *args), LogEnvState(
                 jnp.array(0), 0, 0, 0, 0
             )
@@ -188,14 +197,14 @@ def run_actorcritic_experiment_td0(
         def jit_step(*args):
 
             step_shape = (
-                jax.ShapeDtypeStruct((75,), jnp.float32),
+                jax.ShapeDtypeStruct((27,), jnp.float32),
                 jax.ShapeDtypeStruct((), jnp.int32),
                 jax.ShapeDtypeStruct((), jnp.int32),
                 jax.ShapeDtypeStruct((), jnp.float32),
                 jax.ShapeDtypeStruct((), jnp.int32),
                 None,
             )
-            return jax.pure_callback(callback_step, step_shape, *args)
+            return jax.experimental.io_callback(callback_step, step_shape, *args)
 
         def step_fn(carry, _):
             state, env_state, env_params, step_key, policy_state, ep_len = carry
@@ -557,7 +566,7 @@ def run_actorcritic_experiment_td0(
         )
 
 
-@hydra.main(config_path=".", config_name="config_cont.yaml", version_base="1.2")
+@hydra.main(config_path=".", config_name="config.yaml", version_base="1.2")
 def main(cfg: DictConfig) -> None:
 
     wandb.init(
@@ -568,9 +577,6 @@ def main(cfg: DictConfig) -> None:
     wandb.config = dict_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
     )
-
-    # cfg = OmegaConf.merge(cfg, OmegaConf.create(dict(wandb.config)))
-    # wandb.config = dict(cfg)
 
     optimisers = {
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),

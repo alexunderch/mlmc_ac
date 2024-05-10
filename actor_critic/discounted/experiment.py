@@ -665,7 +665,7 @@ def run_actorcritic_experiment_td0(
         )
 
 
-@hydra.main(config_path=".", config_name="config_disc.yaml", version_base="1.2")
+@hydra.main(config_path=".", config_name="config.yaml", version_base="1.2")
 def main(cfg: DictConfig) -> None:
 
     wandb.init(
@@ -676,9 +676,6 @@ def main(cfg: DictConfig) -> None:
     wandb.config = dict_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
     )
-
-    # cfg = OmegaConf.merge(cfg, OmegaConf.create(dict(wandb.config)))
-    # wandb.config = dict(cfg)
 
     optimisers = {
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),

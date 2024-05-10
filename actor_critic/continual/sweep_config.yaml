@@ -1,4 +1,4 @@
-program: experiment_cont.py
+program: experiment.py
 
 method: grid
 metric:

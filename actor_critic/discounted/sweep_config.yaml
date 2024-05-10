@@ -1,5 +1,4 @@
-program: experiment_ppo.py
-
+program: experiment.py
 
 method: grid
 metric:
@@ -7,11 +6,17 @@ metric:
   name: Episode_Return
 
 parameters:
+  type: 
+    values: ["mc", "td0"]
   experiment.env_id:
     values: [CartPole-v1, Acrobot-v1]
-  optimiser:
+  critic_optimiser:
     values: [adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
-  experiment.mlmc_correction:
+  actor_optimiser:
+    values: [adam, adagrad, sgd]
+  experiment.mlmc_correction_actor:
+    values: [true, false]
+  experiment.mlmc_correction_critic:
     values: [true, false]
   seed:
     values: [1, 11, 111]
