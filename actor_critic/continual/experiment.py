@@ -303,18 +303,16 @@ def run_actorcritic_experiment_td0(
         values = apply_fn({"params": params}, observations).squeeze(-1)
         next_values = apply_fn({"params": params}, next_observations).squeeze(-1)
         td_target = (
-            returns
-            - av_reward.squeeze(-1)
-            + (1.0 - dones) * jax.lax.stop_gradient(next_values)
+            returns - av_reward + (1.0 - dones) * jax.lax.stop_gradient(next_values)
         )
         return optax.l2_loss(values, td_target).mean(), td_target - values
 
     @jax.jit
     def reward_tracker_loss_fn(params, returns):
         apply_fn = reward_tracker_state.apply_fn
-        av_reward = apply_fn({"params": params})
+        av_reward = jnp.tile(apply_fn({"params": params}), returns.shape)
         return (
-            optax.l2_loss(returns, jnp.tile(av_reward, returns.shape)).mean(),
+            optax.l2_loss(av_reward, returns).mean(),
             av_reward,
         )
 
@@ -351,7 +349,7 @@ def run_actorcritic_experiment_td0(
             J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound)), int(
                 jnp.ceil((2 ** (J - 1)) * batchsize_bound)
             )
-            (observation, env_state, env_params, rng, policy_state, _), (
+            (observation, env_state, env_params, key, policy_state, _), (
                 observations,
                 next_observations,
                 actions,
@@ -372,7 +370,6 @@ def run_actorcritic_experiment_td0(
                 length=J_t,
                 unroll=False,
             )
-            returns = rewards
 
             (av_reward_loss_value, av_rewards), reward_tracker_grads = (
                 reward_tracker_grad_fn(reward_tracker_state.params, rewards)
@@ -381,7 +378,7 @@ def run_actorcritic_experiment_td0(
             (critic_loss_value, td_errors), critic_grads = critic_loss_grad_fn(
                 critic_state.params,
                 rewards[:batchsize_bound],
-                av_rewards,
+                av_rewards[:batchsize_bound],
                 observations[:batchsize_bound],
                 next_observations[:batchsize_bound],
                 dones[:batchsize_bound],
@@ -397,27 +394,29 @@ def run_actorcritic_experiment_td0(
             if 2**J <= batchsize_limit and J > 0:
                 if mlmc_correction_critic:
 
-                    (_, av_rewards), reward_tracker_grads_t = reward_tracker_grad_fn(
-                        reward_tracker_state.params, returns
+                    (_, av_rewards_t), reward_tracker_grads_t = reward_tracker_grad_fn(
+                        reward_tracker_state.params, rewards
                     )
 
                     (_, td_errors), critic_mlmc_grads_t = critic_loss_grad_fn(
                         critic_state.params,
-                        returns,
-                        av_rewards,
+                        rewards,
+                        av_rewards_t,
                         observations,
                         next_observations,
                         dones,
                     )  # t
 
-                    _, reward_tracker_grads_tm1 = reward_tracker_grad_fn(
-                        reward_tracker_state.params, returns
+                    (_, av_rewards_tm1), reward_tracker_grads_tm1 = (
+                        reward_tracker_grad_fn(
+                            reward_tracker_state.params, rewards[:J_tm1]
+                        )
                     )
 
                     _, critic_mlmc_grads_tm1 = critic_loss_grad_fn(
                         critic_state.params,
-                        returns[:J_tm1],
-                        av_rewards[:J_tm1],
+                        rewards[:J_tm1],
+                        av_rewards_tm1,
                         observations[:J_tm1],
                         next_observations[:J_tm1],
                         dones[:J_tm1],
@@ -440,18 +439,22 @@ def run_actorcritic_experiment_td0(
                 if mlmc_correction_actor:
                     if not mlmc_correction_critic:
                         _, av_rewards = reward_tracker_loss_fn(
-                            reward_tracker_state.params, returns
+                            reward_tracker_state.params, rewards
                         )
 
                         _, td_errors = critic_loss_fn(
                             critic_state.params,
-                            returns,
+                            rewards,
                             av_rewards,
                             observations,
                             next_observations,
                             dones,
                         )
-                    # td_errors = td_errors - td_errors.mean() / (td_errors.std() + 1e-6)
+
+                    td_errors = (td_errors - td_errors.mean()) / (
+                        td_errors.std() + 1e-6
+                    )
+
                     _, policy_mlmc_grads_t = actor_loss_grad_fn(
                         policy_state.params, observations, actions, td_errors
                     )  # t
@@ -461,6 +464,7 @@ def run_actorcritic_experiment_td0(
                         actions[:J_tm1],
                         td_errors[:J_tm1],
                     )  # tm1
+
                     policy_grads = jax.tree.map(
                         lambda g, x, y: g + (2**J) * (x - y),
                         policy_grads,
@@ -502,6 +506,9 @@ def run_actorcritic_experiment_td0(
                 next_observations,
                 dones,
             )
+
+            td_errors = (td_errors - td_errors.mean()) / (td_errors.std() + 1e-6)
+
             actor_loss_value, policy_grads = actor_loss_grad_fn(
                 policy_state.params, observations, actions, td_errors
             )
@@ -523,12 +530,13 @@ def run_actorcritic_experiment_td0(
             reward_tracker_state,
             observation,
             env_state,
+            key,
         )
 
     state, env_state = jit_reset(reset_key, env_params)
 
     for i_episode in range(1, n_training_episodes + 1):
-        loss_key, key, step_key = jax.random.split(key, 3)
+        loss_key, step_key = jax.random.split(key)
 
         (
             loss,
@@ -538,6 +546,7 @@ def run_actorcritic_experiment_td0(
             reward_tracker_state,
             state,
             env_state,
+            key,
         ) = ac_update(
             policy_state,
             critic_state,
@@ -556,7 +565,7 @@ def run_actorcritic_experiment_td0(
             {
                 "Actor_Grad_Norm": grad_norm[0].mean().item(),
                 "Critic_Grad_Norm": grad_norm[1].mean().item(),
-                "Reward_Tracker_Loss": loss[2].mean().item(),
+                "Average_Reward_Tracker": loss[2].mean().item(),
                 "Value_Loss": loss[1].mean().item(),
                 "Policy_Loss": loss[0].mean().item(),
                 "Step": i_episode,

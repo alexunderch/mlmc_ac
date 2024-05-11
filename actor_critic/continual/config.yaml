@@ -8,14 +8,14 @@ momentum:
   decay_beta: 0.15
   decay_p: 0.48
 
-learning_rate: 3.E-4
+learning_rate: 3.E-3
 
 experiment:
   env_id: pogema
-  n_training_episodes: 15000
-  batchsize_bound: 4
+  n_training_episodes: 20000
+  batchsize_bound: 3
   max_t: 500
-  batchsize_limit: 16
+  batchsize_limit: 8
   mlmc_correction_actor: false
   mlmc_correction_critic: false
   env_kwargs:
