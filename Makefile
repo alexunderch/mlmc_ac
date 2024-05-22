@@ -9,7 +9,7 @@ endif
 BASE_FLAGS=-itd --rm  -v ${PWD}:/home/workdir --shm-size 20G --name ${USER}.mlmc4rl
 RUN_FLAGS=$(GPUS) $(BASE_FLAGS)
 
-DOCKER_IMAGE_NAME = dreamercleanrl
+DOCKER_IMAGE_NAME = mlmc4rl
 IMAGE = $(DOCKER_IMAGE_NAME):latest
 DOCKER_RUN=docker run $(RUN_FLAGS) $(IMAGE)
 USE_CUDA = $(if $(GPUS),true,false)

@@ -32,8 +32,7 @@ import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
 
-DEBUG_POGEMA = True
-
+DEBUG_POGEMA = False
 
 def isr_decay(initial_value: float) -> base.Schedule:
     """Constructs a square root decaying schedule.
@@ -121,6 +120,8 @@ def run_actorcritic_experiment_td0(
     # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
+    metrics_deque = deque(maxlen=100)
+
     if "pogema" not in env_id:
         env, env_params = gymnax.make(env_id)
         env = gymnax.wrappers.LogWrapper(env)
@@ -153,6 +154,8 @@ def run_actorcritic_experiment_td0(
         env = _make_pogema(config)
         env = AutoResetWrapper(env)
 
+        metrics_key = "avg_throughput" if config.on_target == "restart" else "ISR"
+
         if DEBUG_POGEMA:
             import pogema.animation
 
@@ -165,21 +168,31 @@ def run_actorcritic_experiment_td0(
             env_state: jax.Array
             episode_returns: jax.Array
             episode_lengths: jax.Array
+            episode_metrics: jax.Array
             returned_episode_returns: jax.Array
             returned_episode_lengths: jax.Array
+            returned_episode_metrics: jax.Array
 
         def callback_step(observation, key, env_state, env_params):
             action = act(policy_state, observation, key)
             observation, reward, terminated, truncated, info = env.step(action=[action])
+
+            metrics = jnp.array(0.0)
+            if "metrics" in info[0]:
+                metrics = jnp.array(info[0]["metrics"][metrics_key])
+            
             return (
                 jnp.array(observation[0]).reshape(-1),
                 action,
                 (env_state + 1).astype(jnp.int32),
                 jnp.array(reward[0]),
-                jnp.maximum(jnp.array(terminated[0]), jnp.array(truncated[0])).astype(
-                    jnp.int32
+                jax.lax.cond(
+                    metrics_key == "ISR",
+                    lambda term, trunc: jnp.maximum(term, trunc).astype(jnp.int32),
+                    lambda term, trunc: trunc.astype(jnp.int32),
+                    jnp.array(terminated[0]), jnp.array(truncated[0]),
                 ),
-                None,
+                metrics   
             )
 
         @jax.jit
@@ -191,7 +204,7 @@ def run_actorcritic_experiment_td0(
         def jit_reset(*args):
             reset_shape = jax.ShapeDtypeStruct((27,), jnp.float32)
             return jax.pure_callback(callback_reset, reset_shape, *args), LogEnvState(
-                jnp.array(0), 0, 0, 0, 0
+                jnp.array(0), 0, 0, 0, 0, 0, 0
             )
 
         def jit_step(*args):
@@ -202,7 +215,7 @@ def run_actorcritic_experiment_td0(
                 jax.ShapeDtypeStruct((), jnp.int32),
                 jax.ShapeDtypeStruct((), jnp.float32),
                 jax.ShapeDtypeStruct((), jnp.int32),
-                None,
+                jax.ShapeDtypeStruct((), jnp.float32),
             )
             return jax.experimental.io_callback(callback_step, step_shape, *args)
 
@@ -212,16 +225,21 @@ def run_actorcritic_experiment_td0(
             next_state, action, new_env_state, reward, done, info = jit_step(
                 state, act_key, env_state.env_state, env_params
             )
+
+            new_episode_metrics = info
             new_episode_return = env_state.episode_returns + reward
             new_episode_length = env_state.episode_lengths + 1
             env_state = LogEnvState(
                 env_state=new_env_state,
                 episode_returns=new_episode_return * (1 - done),
                 episode_lengths=new_episode_length * (1 - done),
+                episode_metrics=new_episode_metrics * (1 - done),
                 returned_episode_returns=env_state.returned_episode_returns * (1 - done)
                 + new_episode_return * done,
                 returned_episode_lengths=env_state.returned_episode_lengths * (1 - done)
                 + new_episode_length * done,
+                returned_episode_metrics=env_state.returned_episode_metrics * (1 - done)
+                + new_episode_metrics * done,
             )
 
             return (
@@ -560,6 +578,7 @@ def run_actorcritic_experiment_td0(
 
         scores_deque.append(env_state.returned_episode_returns)
         lengths_deque.append(env_state.returned_episode_lengths)
+        metrics_deque.append(env_state.returned_episode_metrics)
 
         wandb.log(
             {
@@ -571,6 +590,8 @@ def run_actorcritic_experiment_td0(
                 "Step": i_episode,
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
+                f"Episode_{metrics_key}": np.mean(metrics_deque),
+
             }
         )
 
