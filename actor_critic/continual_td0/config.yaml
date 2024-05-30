@@ -12,8 +12,8 @@ learning_rate: 3.E-3
 
 experiment:
   env_id: pogema
-  n_training_episodes: 20000
-  batchsize_bound: 2
+  n_training_episodes: 10000
+  batchsize_bound: 3
   max_t: 500
   batchsize_limit: 8
   mlmc_correction_actor: false

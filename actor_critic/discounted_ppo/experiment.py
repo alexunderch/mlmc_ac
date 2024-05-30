@@ -174,7 +174,7 @@ def run_actorcritic_experiment_ppo(
     network = ActorCritic(env.num_actions)
 
     init_network_key, reset_key, key = jax.random.split(jax.random.key(seed), 3)
-    initial_obs, env_state = env.reset(reset_key, env_params)
+    initial_obs, env_state = jit_reset(reset_key, env_params)
 
     policy_state = TrainState.create(
         apply_fn=jax.jit(network.apply),

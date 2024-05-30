@@ -8,7 +8,7 @@ metric:
 
 parameters:
   experiment.env_id:
-    values: [CartPole-v1, Acrobot-v1]
+    values: ["pogema"] #CartPole-v1, Acrobot-v1, 
   optimiser:
     values: [adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
   experiment.mlmc_correction:
