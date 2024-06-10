@@ -1,16 +1,15 @@
 program: experiment.py
 
-
 method: grid
 metric:
   goal: maximize
-  name: Episode_Return
+  name: Average_reward
 
 parameters:
   experiment.env_id:
-    values: [pogema] #"pogema", CartPole-v1, Acrobot-v1, 
+    values: [CartPole-v1, Acrobot-v1]
   optimiser:
-    values: [adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
+    values: [adagrad, sgd, adam]
   experiment.mlmc_correction:
     values: [true, false]
   seed:

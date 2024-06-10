@@ -4,7 +4,6 @@ from collections import deque
 from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
-import gymnasium as gym
 import jax
 import jax.experimental
 import jax.numpy as jnp
@@ -33,6 +32,7 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 
 DEBUG_POGEMA = False
+
 
 def isr_decay(initial_value: float) -> base.Schedule:
     """Constructs a square root decaying schedule.
@@ -123,6 +123,8 @@ def run_actorcritic_experiment_td0(
     metrics_deque = deque(maxlen=100)
 
     if "pogema" not in env_id:
+        metrics_key = "Nil"
+
         env, env_params = gymnax.make(env_id)
         env = gymnax.wrappers.LogWrapper(env)
 
@@ -180,7 +182,7 @@ def run_actorcritic_experiment_td0(
             metrics = jnp.array(0.0)
             if "metrics" in info[0]:
                 metrics = jnp.array(info[0]["metrics"][metrics_key])
-            
+
             return (
                 jnp.array(observation[0]).reshape(-1),
                 action,
@@ -190,9 +192,10 @@ def run_actorcritic_experiment_td0(
                     metrics_key == "ISR",
                     lambda term, trunc: jnp.maximum(term, trunc).astype(jnp.int32),
                     lambda term, trunc: trunc.astype(jnp.int32),
-                    jnp.array(terminated[0]), jnp.array(truncated[0]),
+                    jnp.array(terminated[0]),
+                    jnp.array(truncated[0]),
                 ),
-                metrics   
+                metrics,
             )
 
         @jax.jit
@@ -578,7 +581,8 @@ def run_actorcritic_experiment_td0(
 
         scores_deque.append(env_state.returned_episode_returns)
         lengths_deque.append(env_state.returned_episode_lengths)
-        metrics_deque.append(env_state.returned_episode_metrics)
+        if "pogema" in env_id:
+            metrics_deque.append(env_state.returned_episode_metrics)
 
         wandb.log(
             {
@@ -591,7 +595,6 @@ def run_actorcritic_experiment_td0(
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
                 f"Episode_{metrics_key}": np.mean(metrics_deque),
-
             }
         )
 
@@ -638,7 +641,7 @@ def main(cfg: DictConfig) -> None:
         critic_optimiser=critic_optimiser,
         reward_optimiser=reward_optimiser,
         **dict_config["experiment"],
-        seed=dict_config["seed"]
+        seed=dict_config["seed"],
     )
 
 

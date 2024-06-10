@@ -1,0 +1,20 @@
+seed: 0
+optimiser: adam
+learning_rate: 1.E-3
+
+experiment:
+  env_id: CartPole-v1
+  n_training_episodes: 2000
+  batchsize_bound: 4
+  batchsize_limit: 16
+  mlmc_correction: false
+  env_kwargs:
+    on_target: restart
+    size: 8  # size of the grid
+    density: 0.0  # obstacle density
+    max_episode_steps: 64  # horizon
+    obs_radius: 1  # defines field of view
+
+wandb:
+  project: MLMCOptimiser 
+  entity: alexunderch
