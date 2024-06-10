@@ -12,7 +12,7 @@ anneal_lr: false
 
 experiment:
   env_id: CartPole-v1
-  n_training_episodes: 5000
+  n_training_episodes: 2000
   batchsize_bound: 128
   max_t: 500
   batchsize_limit: 32

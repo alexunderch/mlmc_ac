@@ -14,6 +14,9 @@ from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
+from pogema.envs import _make_pogema
+from pogema.grid_config import GridConfig
+from pogema.integrations.sample_factory import AutoResetWrapper
 
 warnings.filterwarnings("ignore")
 
@@ -22,6 +25,8 @@ import gymnax.wrappers
 import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
+
+DEBUG_POGEMA = False
 
 
 class Transition(NamedTuple):
@@ -117,15 +122,12 @@ def run_actorcritic_experiment_ppo(
     batchsize_bound: int,
     batchsize_limit: int,
     mlmc_correction: bool,
+    env_kwargs: Optional[dict] = None,
 ):
     # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
-    env, env_params = gymnax.make(env_id)
-    env = gymnax.wrappers.LogWrapper(env)
-
-    jit_step = jax.jit(env.step)
-    jit_reset = jax.jit(env.reset)
+    metrics_deque = deque(maxlen=100)
 
     @jax.jit
     def act(policy_state, observations, key):
@@ -142,24 +144,138 @@ def run_actorcritic_experiment_ppo(
         _, value = policy_state.apply_fn({"params": policy_state.params}, observations)
         return value
 
-    def step_fn(carry, _):
-        state, env_state, env_params, step_key, policy_state, ep_len = carry
-        env_step_key, act_key, key = jax.random.split(step_key, 3)
-        action, log_prob, value = act(policy_state, state, act_key)
-        next_state, new_env_state, reward, done, info = jit_step(
-            env_step_key, env_state, action, env_params
-        )
-        return (
-            (
-                next_state,
-                new_env_state,
-                env_params,
-                key,
-                policy_state,
-                ep_len + (1 - done.astype(jnp.int32)),
-            ),
-            Transition(state, action, log_prob, reward, value, done, info),
-        )
+    if "pogema" not in env_id:
+        metrics_key = "Nil"
+        env, env_params = gymnax.make(env_id)
+        env = gymnax.wrappers.LogWrapper(env)
+
+        jit_step = jax.jit(env.step)
+        jit_reset = jax.jit(env.reset)
+
+        def step_fn(carry, _):
+            state, env_state, env_params, step_key, policy_state, ep_len = carry
+            env_step_key, act_key, key = jax.random.split(step_key, 3)
+            action, log_prob, value = act(policy_state, state, act_key)
+            next_state, new_env_state, reward, done, info = jit_step(
+                env_step_key, env_state, action, env_params
+            )
+            return (
+                (
+                    next_state,
+                    new_env_state,
+                    env_params,
+                    key,
+                    policy_state,
+                    ep_len + (1 - done.astype(jnp.int32)),
+                ),
+                Transition(state, action, log_prob, reward, value, done, info),
+            )
+
+    else:
+        config = GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
+        env = _make_pogema(config)
+        env = AutoResetWrapper(env)
+
+        metrics_key = "avg_throughput" if config.on_target == "restart" else "ISR"
+
+        if DEBUG_POGEMA:
+            import pogema.animation
+
+            env = pogema.animation.AnimationMonitor(env)
+
+        env_params = None
+
+        @dataclass
+        class LogEnvState:
+            env_state: jax.Array
+            episode_returns: jax.Array
+            episode_lengths: jax.Array
+            episode_metrics: jax.Array
+            returned_episode_returns: jax.Array
+            returned_episode_lengths: jax.Array
+            returned_episode_metrics: jax.Array
+
+        def callback_step(action, env_state, env_params):
+            observation, reward, terminated, truncated, info = env.step(action=[action])
+
+            metrics = jnp.array(0.0)
+            if "metrics" in info[0]:
+                metrics = jnp.array(info[0]["metrics"][metrics_key])
+
+            return (
+                jnp.array(observation[0]).reshape(-1),
+                action,
+                (env_state + 1).astype(jnp.int32),
+                jnp.array(reward[0]),
+                jax.lax.cond(
+                    metrics_key == "ISR",
+                    lambda term, trunc: jnp.maximum(term, trunc).astype(jnp.int32),
+                    lambda term, trunc: trunc.astype(jnp.int32),
+                    jnp.array(terminated[0]),
+                    jnp.array(truncated[0]),
+                ),
+                metrics,
+            )
+
+        @jax.jit
+        def callback_reset(seed, env_params):
+            int_seed = jax.random.randint(seed, (), 0, 1000)
+            observation, _ = env.reset(seed=int_seed)
+            return jnp.array(observation[0]).reshape(-1)
+
+        def jit_reset(*args):
+            reset_shape = jax.ShapeDtypeStruct((27,), jnp.float32)
+            return jax.pure_callback(callback_reset, reset_shape, *args), LogEnvState(
+                jnp.array(0), 0, 0, 0, 0, 0, 0
+            )
+
+        def jit_step(*args):
+
+            step_shape = (
+                jax.ShapeDtypeStruct((27,), jnp.float32),
+                jax.ShapeDtypeStruct((), jnp.int32),
+                jax.ShapeDtypeStruct((), jnp.int32),
+                jax.ShapeDtypeStruct((), jnp.float32),
+                jax.ShapeDtypeStruct((), jnp.int32),
+                jax.ShapeDtypeStruct((), jnp.float32),
+            )
+            return jax.experimental.io_callback(callback_step, step_shape, *args)
+
+        def step_fn(carry, _):
+            state, env_state, env_params, step_key, policy_state, ep_len = carry
+            act_key, key = jax.random.split(step_key, 2)
+            action, log_prob, value = act(policy_state, state, act_key)
+
+            next_state, action, new_env_state, reward, done, info = jit_step(
+                action, env_state.env_state, env_params
+            )
+
+            new_episode_metrics = info
+            new_episode_return = env_state.episode_returns + reward
+            new_episode_length = env_state.episode_lengths + 1
+            env_state = LogEnvState(
+                env_state=new_env_state,
+                episode_returns=new_episode_return * (1 - done),
+                episode_lengths=new_episode_length * (1 - done),
+                episode_metrics=new_episode_metrics * (1 - done),
+                returned_episode_returns=env_state.returned_episode_returns * (1 - done)
+                + new_episode_return * done,
+                returned_episode_lengths=env_state.returned_episode_lengths * (1 - done)
+                + new_episode_length * done,
+                returned_episode_metrics=env_state.returned_episode_metrics * (1 - done)
+                + new_episode_metrics * done,
+            )
+            return (
+                (
+                    next_state,
+                    env_state,
+                    env_params,
+                    key,
+                    policy_state,
+                    ep_len + (1 - done.astype(jnp.int32)),
+                ),
+                Transition(state, action, log_prob, reward, value, done, info),
+            )
 
     class ActorCritic(nn.Module):
         num_actions: jnp.ndarray
@@ -171,7 +287,9 @@ def run_actorcritic_experiment_ppo(
 
             return policy_logits, values.squeeze(-1)
 
-    network = ActorCritic(env.num_actions)
+    network = ActorCritic(
+        env.num_actions if "pogema" not in env_id else env.action_space.n
+    )
 
     init_network_key, reset_key, key = jax.random.split(jax.random.key(seed), 3)
     initial_obs, env_state = jit_reset(reset_key, env_params)
@@ -239,10 +357,8 @@ def run_actorcritic_experiment_ppo(
     def ppo_update(
         policy_state,
         env_state,
+        observation,
         env_params,
-        traj_batch,
-        advantages,
-        targets,
         rng,
         env_rng,
     ):
@@ -262,27 +378,12 @@ def run_actorcritic_experiment_ppo(
                 ).item()
             )
 
-            (loss_value, (value_loss, loss_actor, entropy)), grads = loss_grad_fn(
-                policy_state.params,
-                jax.tree.map(lambda x: x[:batchsize_bound], traj_batch),
-                advantages[:batchsize_bound],
-                targets[:batchsize_bound],
-            )  # 0
-
             J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound)), int(
                 jnp.ceil((2 ** (J - 1)) * batchsize_bound)
             )
-            observation = traj_batch.observation[batchsize_bound - 1]
-            # mlmc batch_size
-            if 2**J <= batchsize_limit and J > 0:
-                (
-                    observation,
-                    env_state,
-                    env_params,
-                    rng,
-                    policy_state,
-                    _,
-                ), traj_batch = jax.lax.scan(
+
+            (observation, env_state, env_params, key, policy_state, _), traj_batch = (
+                jax.lax.scan(
                     step_fn,
                     (
                         observation,
@@ -294,10 +395,21 @@ def run_actorcritic_experiment_ppo(
                     ),
                     xs=None,
                     length=J_t,
+                    unroll=False,
                 )
+            )
+            last_val = value(policy_state, observation)
+            advantages, targets = _calculate_gae(traj_batch, last_val)
 
-                last_val = value(policy_state, observation)
-                advantages, targets = _calculate_gae(traj_batch, last_val)
+            (loss_value, (value_loss, loss_actor, entropy)), grads = loss_grad_fn(
+                policy_state.params,
+                jax.tree.map(lambda x: x[:batchsize_bound], traj_batch),
+                advantages[:batchsize_bound],
+                targets[:batchsize_bound],
+            )  # 0
+
+            # mlmc batch_size
+            if 2**J <= batchsize_limit and J > 0:
 
                 _, mlmc_grads_t = loss_grad_fn(
                     policy_state.params, traj_batch, advantages, targets
@@ -315,7 +427,24 @@ def run_actorcritic_experiment_ppo(
                     mlmc_grads_tm1,
                 )
         else:
-            observation = traj_batch.observation[-1]
+            (observation, env_state, env_params, key, policy_state, _), traj_batch = (
+                jax.lax.scan(
+                    step_fn,
+                    (
+                        observation,
+                        env_state,
+                        env_params,
+                        step_key,
+                        policy_state,
+                        jnp.array(0),
+                    ),
+                    xs=None,
+                    length=jnp.minimum(max_t, batchsize_bound),
+                )
+            )
+
+            last_val = value(policy_state, observation)
+            advantages, targets = _calculate_gae(traj_batch, last_val)
 
             (loss_value, (value_loss, loss_actor, entropy)), grads = loss_grad_fn(
                 policy_state.params, traj_batch, advantages, targets
@@ -329,24 +458,13 @@ def run_actorcritic_experiment_ppo(
             (value_loss, loss_actor, entropy),
             observation,
             env_state,
+            key,
         )
 
     state, env_state = jit_reset(reset_key, env_params)
 
     for i_episode in range(1, n_training_episodes + 1):
         loss_key, reset_key, step_key = jax.random.split(key, 3)
-
-        (_state, _env_state, env_params, key, policy_state, _), traj_batch = (
-            jax.lax.scan(
-                step_fn,
-                (state, env_state, env_params, step_key, policy_state, jnp.array(0)),
-                xs=None,
-                length=jnp.minimum(max_t, batchsize_bound),
-            )
-        )
-
-        last_val = value(policy_state, state)
-        advantages, targets = _calculate_gae(traj_batch, last_val)
 
         (
             loss,
@@ -355,23 +473,20 @@ def run_actorcritic_experiment_ppo(
             (value_loss, actor_loss, entropy),
             state,
             env_state,
+            key,
         ) = ppo_update(
             policy_state,
             env_state,
+            state,
             env_params,
-            traj_batch,
-            advantages,
-            targets,
             loss_key,
             step_key,
         )
 
-        if not mlmc_correction:
-            state = _state
-            env_state = _env_state
-
         scores_deque.append(env_state.returned_episode_returns)
         lengths_deque.append(env_state.returned_episode_lengths)
+        if "pogema" in env_id:
+            metrics_deque.append(env_state.returned_episode_metrics)
 
         wandb.log(
             {
@@ -383,6 +498,7 @@ def run_actorcritic_experiment_ppo(
                 "Step": i_episode,
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
+                f"Episode_{metrics_key}": np.mean(metrics_deque),
             }
         )
 
