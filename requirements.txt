@@ -8,6 +8,6 @@ hydra-core
 pandas
 wheel
 wandb
-pogema
+pogema==1.2.2
 pydantic==1.9.1
 typing-extensions==4.5.0

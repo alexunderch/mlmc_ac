@@ -13,10 +13,10 @@ anneal_lr: false
 
 experiment:
   env_id: pogema #CartPole-v1
-  n_training_episodes: 2000
+  n_training_episodes: 10000
   batchsize_bound: 6
   max_t: 500
-  batchsize_limit: 64
+  batchsize_limit: 32
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coeff: 1.0

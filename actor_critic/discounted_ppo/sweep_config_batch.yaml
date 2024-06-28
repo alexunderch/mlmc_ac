@@ -1,0 +1,24 @@
+program: experiment.py
+
+method: grid
+metric:
+  goal: maximize
+  name: Episode_Return
+
+parameters:
+  experiment.env_id:
+    values: [pogema, Acrobot-v1]
+  optimiser:
+    values: [adam, accelerated_sgd_adagrad]
+  experiment.batchsize_bound:
+    values: [2, 4, 16, 64, 128]
+  experiment.mlmc_correction:
+    values: [true, false]
+  seed:
+    values: [1, 11, 111]
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- ${args_no_hyphens}

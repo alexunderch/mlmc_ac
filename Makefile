@@ -6,7 +6,7 @@ GPUS=
 endif
 
 # Set flag for docker run command
-BASE_FLAGS=-itd --rm  -v ${PWD}:/home/workdir --shm-size 20G --name ${USER}.mlmc4rl
+BASE_FLAGS=-itd --rm  -v ${PWD}:/home/workdir --shm-size 20G --name ${USER}.mlmc4rltmp
 RUN_FLAGS=$(GPUS) $(BASE_FLAGS)
 
 DOCKER_IMAGE_NAME = mlmc4rl

@@ -1,5 +1,6 @@
 seed: 0
-optimiser: adam
+actor_optimiser: adam
+critic_optimiser: adam
 
 momentum:
   decay_theta: 0.87
@@ -7,29 +8,25 @@ momentum:
   decay_beta: 0.15
   decay_p: 0.48
 
-learning_rate: 3.E-4
-anneal_lr: false
+learning_rate: 1.E-3
+
 
 experiment:
-  env_id: CartPole-v1
+  env_id: pogema
   n_training_episodes: 10000
-  batchsize_bound: 6
+  batchsize_bound: 3
   max_t: 500
-  batchsize_limit: 32
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_eps: 0.2
-  vf_coeff: 0.5
-  ent_coeff: 1.E-2
-  mlmc_correction: false
+  batchsize_limit: 8
+  mlmc_correction_actor: true
+  mlmc_correction_critic: true
+  ppgae: false
   env_kwargs:
     on_target: restart
     size: 8  # size of the grid
     density: 0.0  # obstacle density
     max_episode_steps: 64  # horizon
     obs_radius: 1  # defines field of view
-
 wandb:
   project: MLMCOptimiser 
-  # name: actor_critic_ppo
+  # name: actor_critic_montecarlo
   entity: alexunderch

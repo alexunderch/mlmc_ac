@@ -3,6 +3,7 @@ FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 # install python
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.10
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 RUN apt-get update && \
   DEBIAN_FRONTEND=noninteractive apt-get -qq -y install \
