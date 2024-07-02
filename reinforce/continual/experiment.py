@@ -11,6 +11,7 @@ import optax
 import optax._src.base as base
 import optax._src.utils as utils
 import pandas as pd
+import yaml
 from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
@@ -21,6 +22,8 @@ from optax.tree_utils import tree_add
 from pogema.envs import _make_pogema
 from pogema.grid_config import GridConfig
 from pogema.integrations.sample_factory import AutoResetWrapper
+from pogema_toolbox.create_env import MultiMapWrapper
+from pogema_toolbox.registry import ToolboxRegistry
 
 warnings.filterwarnings("ignore")
 
@@ -111,11 +114,21 @@ def run_reinforce_experiment(
     batchsize_bound: int,
     batchsize_limit: int,
     mlmc_correction: bool = False,
+    total_samples: Optional[int] = None,
     env_kwargs: Optional[dict] = None,
 ):
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
+
+    total_samples: int = (
+        int(total_samples)
+        if total_samples is not None
+        else batchsize_bound * n_training_episodes
+    )
+
+    sample_counter: int = 0
+    stopping_criterium = lambda k: k > total_samples
 
     if "pogema" not in env_id:
         metrics_key = "Nil"
@@ -147,16 +160,31 @@ def run_reinforce_experiment(
 
     else:
 
-        config = GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
-        env = _make_pogema(config)
-        env = AutoResetWrapper(env)
+        map_filename = env_kwargs.get("map_filename")
+        env_kwargs.pop("map_filename")
+        if map_filename is None:
+            config = GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
+            env = _make_pogema(config)
+            env = AutoResetWrapper(env)
+        else:
+            with open(map_filename, "r") as f:
+                maps = yaml.safe_load(f)
+            ToolboxRegistry.register_maps(maps)
+            env = _make_pogema(
+                GridConfig(
+                    **env_kwargs,
+                    seed=seed + 1,
+                    num_agents=1,
+                )
+            )
+            env = MultiMapWrapper(env)
 
         metrics_key = "avg_throughput" if config.on_target == "restart" else "ISR"
 
         if DEBUG_POGEMA:
-            import pogema.animation
+            from pogema import AnimationMonitor
 
-            env = pogema.animation.AnimationMonitor(env)
+            env = AnimationMonitor(env)
 
         env_params = None
 
@@ -339,6 +367,7 @@ def run_reinforce_experiment(
         observation,
         rng,
         env_rng,
+        sample_counter,
     ):
 
         loss_grad_fn = jax.value_and_grad(policy_loss_fn)
@@ -398,12 +427,10 @@ def run_reinforce_experiment(
                 returns[:batchsize_bound],
             )  # 0
 
-            J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound)), int(
-                jnp.ceil((2 ** (J - 1)) * batchsize_bound)
-            )
-
             # mlmc batch_size
             if 2**J <= batchsize_limit and J > 0:
+                sample_counter += J_t
+
                 (_, av_rewards_t), reward_tracker_grads_t = reward_tracker_grad_fn(
                     reward_tracker_state.params, rewards
                 )
@@ -442,7 +469,10 @@ def run_reinforce_experiment(
                     reward_tracker_grads_t,
                     reward_tracker_grads_tm1,
                 )
+            else:
+                sample_counter += batchsize_bound
         else:
+            sample_counter += batchsize_bound
             (observation, env_state, env_params, key, policy_state, _), (
                 observations,
                 actions,
@@ -488,6 +518,7 @@ def run_reinforce_experiment(
             observation,
             env_state,
             key,
+            sample_counter,
         )
 
     state, env_state = jit_reset(reset_key, env_params)
@@ -495,16 +526,27 @@ def run_reinforce_experiment(
     for i_episode in range(1, int(n_training_episodes) + 1):
         loss_key, reset_key, step_key = jax.random.split(key, 3)
 
-        loss, grad_norm, policy_state, reward_tracker_state, state, env_state, key = (
-            reinforce_update(
-                policy_state,
-                reward_tracker_state,
-                env_state,
-                env_params,
-                state,
-                loss_key,
-                step_key,
-            )
+        if stopping_criterium(sample_counter):
+            break
+
+        (
+            loss,
+            grad_norm,
+            policy_state,
+            reward_tracker_state,
+            state,
+            env_state,
+            key,
+            sample_counter,
+        ) = reinforce_update(
+            policy_state,
+            reward_tracker_state,
+            env_state,
+            env_params,
+            state,
+            loss_key,
+            step_key,
+            sample_counter,
         )
 
         scores_deque.append(env_state.returned_episode_returns)
@@ -521,7 +563,8 @@ def run_reinforce_experiment(
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
                 f"Episode_{metrics_key}": np.mean(metrics_deque),
-            }
+                "env_steps": sample_counter,
+            },
         )
 
 
@@ -535,6 +578,7 @@ def main(cfg: DictConfig) -> None:
         entity=cfg.wandb.entity,
         project=cfg.wandb.project,
     )
+    wandb.define_metric("env_steps")
 
     optimisers = {
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),
