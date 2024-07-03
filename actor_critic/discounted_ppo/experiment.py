@@ -9,7 +9,6 @@ import numpy as np
 import optax
 import optax._src.base as base
 import optax._src.utils as utils
-import pandas as pd
 from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
@@ -122,12 +121,22 @@ def run_actorcritic_experiment_ppo(
     batchsize_bound: int,
     batchsize_limit: int,
     mlmc_correction: bool,
+    total_samples: Optional[int] = None,
     env_kwargs: Optional[dict] = None,
 ):
     # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
+
+    total_samples: int = (
+        int(total_samples)
+        if total_samples is not None
+        else batchsize_bound * n_training_episodes
+    )
+
+    sample_counter: int = 0
+    stopping_criterium = lambda k: k > total_samples
 
     @jax.jit
     def act(policy_state, observations, key):
@@ -179,9 +188,9 @@ def run_actorcritic_experiment_ppo(
         metrics_key = "avg_throughput" if config.on_target == "restart" else "ISR"
 
         if DEBUG_POGEMA:
-            import pogema.animation
+            from pogema import AnimationMonitor
 
-            env = pogema.animation.AnimationMonitor(env)
+            env = AnimationMonitor(env)
 
         env_params = None
 
@@ -361,6 +370,7 @@ def run_actorcritic_experiment_ppo(
         env_params,
         rng,
         env_rng,
+        sample_counter,
     ):
 
         loss_grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -410,6 +420,7 @@ def run_actorcritic_experiment_ppo(
 
             # mlmc batch_size
             if 2**J <= batchsize_limit and J > 0:
+                sample_counter += J_t
 
                 _, mlmc_grads_t = loss_grad_fn(
                     policy_state.params, traj_batch, advantages, targets
@@ -426,7 +437,10 @@ def run_actorcritic_experiment_ppo(
                     mlmc_grads_t,
                     mlmc_grads_tm1,
                 )
+            else:
+                sample_counter += batchsize_bound
         else:
+            sample_counter += batchsize_bound
             (observation, env_state, env_params, key, policy_state, _), traj_batch = (
                 jax.lax.scan(
                     step_fn,
@@ -459,6 +473,7 @@ def run_actorcritic_experiment_ppo(
             observation,
             env_state,
             key,
+            sample_counter,
         )
 
     state, env_state = jit_reset(reset_key, env_params)
@@ -474,6 +489,7 @@ def run_actorcritic_experiment_ppo(
             state,
             env_state,
             key,
+            sample_counter,
         ) = ppo_update(
             policy_state,
             env_state,
@@ -481,6 +497,7 @@ def run_actorcritic_experiment_ppo(
             env_params,
             loss_key,
             step_key,
+            sample_counter,
         )
 
         scores_deque.append(env_state.returned_episode_returns)
@@ -499,6 +516,7 @@ def run_actorcritic_experiment_ppo(
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
                 f"Episode_{metrics_key}": np.mean(metrics_deque),
+                "env_steps": sample_counter,
             }
         )
 
@@ -514,6 +532,7 @@ def main(cfg: DictConfig) -> None:
         entity=cfg.wandb.entity,
         project=cfg.wandb.project,
     )
+    wandb.define_metric("env_steps")
 
     optimisers = {
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),
@@ -532,8 +551,11 @@ def main(cfg: DictConfig) -> None:
     opt = optax.chain(
         optax.clip_by_global_norm(1000.0), optimisers[dict_config["optimiser"]]
     )
+
     run_actorcritic_experiment_ppo(
-        optimiser=opt, **dict_config["experiment"], seed=dict_config["seed"]
+        optimiser=opt,
+        **dict_config["experiment"],
+        seed=dict_config["seed"],
     )
 
 

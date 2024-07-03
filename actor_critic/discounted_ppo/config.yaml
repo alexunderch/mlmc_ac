@@ -22,6 +22,7 @@ experiment:
   vf_coeff: 0.5
   ent_coeff: 1.E-2
   mlmc_correction: false
+  total_samples: null
   env_kwargs:
     on_target: restart
     size: 8  # size of the grid

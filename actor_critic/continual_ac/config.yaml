@@ -12,14 +12,14 @@ learning_rate: 1.E-3
 
 
 experiment:
-  env_id: pogema
-  n_training_episodes: 10000
-  batchsize_bound: 3
+  env_id: CartPole-v1
+  n_training_episodes: 2000
+  batchsize_bound: 250
   max_t: 500
-  batchsize_limit: 8
-  mlmc_correction_actor: true
-  mlmc_correction_critic: true
-  ppgae: false
+  batchsize_limit: 16
+  mlmc_correction_actor: false
+  mlmc_correction_critic: false
+  total_samples: null
   env_kwargs:
     on_target: restart
     size: 8  # size of the grid

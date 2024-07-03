@@ -115,12 +115,22 @@ def run_actorcritic_experiment_td0(
     batchsize_limit: int,
     mlmc_correction_actor: bool = False,
     mlmc_correction_critic: bool = False,
+    total_samples: Optional[int] = None,
     env_kwargs: Optional[dict] = None,
 ):
     # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
+
+    total_samples: int = (
+        int(total_samples)
+        if total_samples is not None
+        else batchsize_bound * n_training_episodes
+    )
+
+    sample_counter: int = 0
+    stopping_criterium = lambda k: k > total_samples
 
     if "pogema" not in env_id:
         metrics_key = "Nil"
@@ -159,9 +169,9 @@ def run_actorcritic_experiment_td0(
         metrics_key = "avg_throughput" if config.on_target == "restart" else "ISR"
 
         if DEBUG_POGEMA:
-            import pogema.animation
+            from pogema import AnimationMonitor
 
-            env = pogema.animation.AnimationMonitor(env)
+            env = AnimationMonitor(env)
 
         env_params = None
 
@@ -346,6 +356,7 @@ def run_actorcritic_experiment_td0(
         observation,
         rng,
         env_rng,
+        sample_counter,
     ):
 
         actor_loss_grad_fn = jax.value_and_grad(actor_loss_fn)
@@ -413,6 +424,8 @@ def run_actorcritic_experiment_td0(
 
             # mlmc batch_size
             if 2**J <= batchsize_limit and J > 0:
+                sample_counter += J_t
+
                 if mlmc_correction_critic:
 
                     (_, av_rewards_t), reward_tracker_grads_t = reward_tracker_grad_fn(
@@ -492,8 +505,11 @@ def run_actorcritic_experiment_td0(
                         policy_mlmc_grads_t,
                         policy_mlmc_grads_tm1,
                     )
-
+            else:
+                sample_counter += batchsize_bound
         else:
+            sample_counter += batchsize_bound
+
             (observation, env_state, env_params, key, policy_state, _), (
                 observations,
                 next_observations,
@@ -552,12 +568,16 @@ def run_actorcritic_experiment_td0(
             observation,
             env_state,
             key,
+            sample_counter,
         )
 
     state, env_state = jit_reset(reset_key, env_params)
 
     for i_episode in range(1, n_training_episodes + 1):
         loss_key, step_key = jax.random.split(key)
+
+        if stopping_criterium(sample_counter):
+            break
 
         (
             loss,
@@ -568,6 +588,7 @@ def run_actorcritic_experiment_td0(
             state,
             env_state,
             key,
+            sample_counter,
         ) = ac_update(
             policy_state,
             critic_state,
@@ -577,6 +598,7 @@ def run_actorcritic_experiment_td0(
             state,
             loss_key,
             step_key,
+            sample_counter,
         )
 
         scores_deque.append(env_state.returned_episode_returns)
@@ -595,6 +617,7 @@ def run_actorcritic_experiment_td0(
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
                 f"Episode_{metrics_key}": np.mean(metrics_deque),
+                "env_steps": sample_counter,
             }
         )
 
@@ -606,6 +629,7 @@ def main(cfg: DictConfig) -> None:
         entity=cfg.wandb.entity,
         project=cfg.wandb.project,
     )
+    wandb.define_metric("env_steps")
 
     wandb.config = dict_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True

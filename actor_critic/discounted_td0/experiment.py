@@ -1,17 +1,17 @@
 import math
 import warnings
 from collections import deque
-from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
 import jax
-import jax.experimental
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import optax._src.base as base
 import optax._src.utils as utils
+import pandas as pd
+import yaml
 from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
@@ -19,6 +19,8 @@ from flax.training.train_state import TrainState
 from pogema.envs import _make_pogema
 from pogema.grid_config import GridConfig
 from pogema.integrations.sample_factory import AutoResetWrapper
+from pogema_toolbox.create_env import MultiMapWrapper
+from pogema_toolbox.registry import ToolboxRegistry
 
 warnings.filterwarnings("ignore")
 
@@ -100,13 +102,13 @@ def accelerated_trace(
     return base.GradientTransformation(init_fn, update_fn)
 
 
-def run_actorcritic_experiment_montecarlo(
+def run_actorcritic_experiment_td0(
     env_id: str,
     actor_optimiser: optax.GradientTransformation,
     critic_optimiser: optax.GradientTransformation,
-    reward_optimiser: optax.GradientTransformation,
     n_training_episodes: int,
     max_t: int,
+    gamma: float,
     seed: int,
     batchsize_bound: int,
     batchsize_limit: int,
@@ -115,12 +117,6 @@ def run_actorcritic_experiment_montecarlo(
     total_samples: Optional[int] = None,
     env_kwargs: Optional[dict] = None,
 ):
-    """
-    ppgae: Regret Analysis of Policy Gradient Algorithm
-        for Infinite Horizon Average
-        Reward Markov Decision Processes
-    """
-    # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
@@ -159,10 +155,11 @@ def run_actorcritic_experiment_montecarlo(
                     policy_state,
                     ep_len + (1 - done.astype(jnp.int32)),
                 ),
-                (state, action, reward, done, info),
+                (state, next_state, action, reward, done, info),
             )
 
     else:
+
         config = GridConfig(**env_kwargs, seed=seed + 1, num_agents=1)
         env = _make_pogema(config)
         env = AutoResetWrapper(env)
@@ -265,7 +262,7 @@ def run_actorcritic_experiment_montecarlo(
                     policy_state,
                     ep_len + (1 - done.astype(jnp.int32)),
                 ),
-                (state, action, reward, done, info),
+                (state, next_state, action, reward, done, info),
             )
 
     @jax.jit
@@ -285,21 +282,10 @@ def run_actorcritic_experiment_montecarlo(
     )
     critic = nn.Sequential([nn.Dense(1)])
 
-    class RewardTracker(nn.Module):
-        output_dim: int
-
-        @nn.compact
-        def __call__(self):
-            return self.param(
-                "eta", lambda rng, shape: jnp.zeros(shape), (self.output_dim,)
-            )
-
-    reward_tracker = RewardTracker(1)
-
-    init_actor_key, init_critic_key, init_reward_key, reset_key, key = jax.random.split(
-        jax.random.key(seed), 5
+    init_actor_key, init_critic_key, reset_key, key = jax.random.split(
+        jax.random.key(seed), 4
     )
-    initial_obs, env_state = jit_reset(reset_key, env_params)
+    initial_obs, env_state = env.reset(reset_key, env_params)
 
     policy_state = TrainState.create(
         apply_fn=jax.jit(policy.apply),
@@ -313,58 +299,25 @@ def run_actorcritic_experiment_montecarlo(
         tx=critic_optimiser,
     )
 
-    reward_tracker_state = TrainState.create(
-        apply_fn=jax.jit(reward_tracker.apply),
-        params=reward_tracker.init(init_reward_key)["params"],
-        tx=reward_optimiser,
-    )
-
     @jax.jit
-    def actor_loss_fn(params, observations, actions, advantages):
+    def actor_loss_fn(params, observations, actions, td_errors):
         apply_fn = jax.vmap(policy_state.apply_fn, in_axes=(None, 0))
         action_distribution = Categorical(
             logits=apply_fn({"params": params}, observations)
         )
-        return -jnp.mean(action_distribution.log_prob(actions) * advantages)
+        return -jnp.mean(action_distribution.log_prob(actions) * td_errors)
 
     @jax.jit
-    def critic_loss_fn(params, returns, observations, av_reward):
+    def critic_loss_fn(params, returns, observations, next_observations, dones):
         apply_fn = jax.vmap(critic_state.apply_fn, in_axes=(None, 0))
         values = apply_fn({"params": params}, observations).squeeze(-1)
-
-        td_error = returns - av_reward - values
-        return optax.l2_loss(values, returns).mean(), td_error
-
-    @jax.jit
-    def reward_tracker_loss_fn(params, returns):
-        apply_fn = reward_tracker_state.apply_fn
-        av_reward = jnp.tile(apply_fn({"params": params}), returns.shape)
-        return (
-            optax.l2_loss(av_reward, returns).mean(),
-            av_reward,
-        )
-
-    def _calculate_returns(rewards, dones):
-        def _one_step_return(carry, data):
-            ret = carry
-            reward, done = data
-            carry = reward + ret * (1 - done)
-            return carry, carry
-
-        _, returns = jax.lax.scan(
-            _one_step_return,
-            0,
-            (rewards, dones),
-            reverse=True,
-        )
-        eps = jnp.finfo(jnp.float32).eps.item()
-        returns = (returns - returns.mean()) / (returns.std() + eps)
-        return returns
+        next_values = apply_fn({"params": params}, next_observations).squeeze(-1)
+        td_target = returns + gamma * (1.0 - dones) * jax.lax.stop_gradient(next_values)
+        return optax.l2_loss(values, td_target).mean(), td_target - values
 
     def ac_update(
         policy_state,
         critic_state,
-        reward_tracker_state,
         env_state,
         env_params,
         observation,
@@ -375,9 +328,6 @@ def run_actorcritic_experiment_montecarlo(
 
         actor_loss_grad_fn = jax.value_and_grad(actor_loss_fn)
         critic_loss_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-        reward_tracker_grad_fn = jax.value_and_grad(
-            reward_tracker_loss_fn, has_aux=True
-        )
 
         if mlmc_correction_actor or mlmc_correction_critic:
             # truncated geometric distribution
@@ -391,13 +341,13 @@ def run_actorcritic_experiment_montecarlo(
                     / jnp.log(1 - p)
                 ).item()
             )
-
             J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound)), int(
                 jnp.ceil((2 ** (J - 1)) * batchsize_bound)
             )
 
             (observation, env_state, env_params, key, policy_state, _), (
                 observations,
+                next_observations,
                 actions,
                 rewards,
                 dones,
@@ -417,21 +367,15 @@ def run_actorcritic_experiment_montecarlo(
                 unroll=False,
             )
 
-            (_, av_rewards), reward_tracker_grads = reward_tracker_grad_fn(
-                reward_tracker_state.params, rewards
-            )
-
-            returns = _calculate_returns(rewards, dones)
+            returns = rewards
 
             (critic_loss_value, td_errors), critic_grads = critic_loss_grad_fn(
                 critic_state.params,
-                rewards[:batchsize_bound],
+                returns[:batchsize_bound],
                 observations[:batchsize_bound],
-                av_rewards[:batchsize_bound],
+                next_observations[:batchsize_bound],
+                dones[:batchsize_bound],
             )
-
-            td_errors = (td_errors - td_errors.mean()) / (td_errors.std() + 1e-6)
-
             actor_loss_value, policy_grads = actor_loss_grad_fn(
                 policy_state.params,
                 observations[:batchsize_bound],
@@ -444,30 +388,20 @@ def run_actorcritic_experiment_montecarlo(
                 sample_counter += J_t
 
                 if mlmc_correction_critic:
-                    (_, av_rewards_t), reward_tracker_grads_t = reward_tracker_grad_fn(
-                        reward_tracker_state.params, rewards
-                    )
-
                     (_, td_errors), critic_mlmc_grads_t = critic_loss_grad_fn(
-                        critic_state.params, returns, observations, av_rewards
+                        critic_state.params,
+                        returns,
+                        observations,
+                        next_observations,
+                        dones,
                     )  # t
-
-                    td_errors = (td_errors - td_errors.mean()) / (
-                        td_errors.std() + 1e-6
-                    )
-
-                    (_, av_rewards_tm1), reward_tracker_grads_tm1 = (
-                        reward_tracker_grad_fn(
-                            reward_tracker_state.params, rewards[:J_tm1]
-                        )
-                    )
                     _, critic_mlmc_grads_tm1 = critic_loss_grad_fn(
                         critic_state.params,
                         returns[:J_tm1],
                         observations[:J_tm1],
-                        av_rewards[:J_tm1],
+                        next_observations[:J_tm1],
+                        dones[:J_tm1],
                     )  # tm1
-
                     critic_grads = jax.tree.map(
                         lambda g, x, y: g + (2**J) * (x - y),
                         critic_grads,
@@ -475,27 +409,18 @@ def run_actorcritic_experiment_montecarlo(
                         critic_mlmc_grads_tm1,
                     )
 
-                    reward_tracker_grads = jax.tree.map(
-                        lambda g, x, y: g + (2**J) * (x - y),
-                        reward_tracker_grads,
-                        reward_tracker_grads_t,
-                        reward_tracker_grads_tm1,
-                    )
-
                 if mlmc_correction_actor:
                     if not mlmc_correction_critic:
-                        _, av_rewards = reward_tracker_loss_fn(
-                            reward_tracker_state.params, rewards
-                        )
-
                         _, td_errors = critic_loss_fn(
-                            critic_state.params, returns, observations, av_rewards
+                            critic_state.params,
+                            returns,
+                            observations,
+                            next_observations,
+                            dones,
                         )
-
-                        td_errors = (td_errors - td_errors.mean()) / (
-                            td_errors.std() + 1e-6
-                        )
-
+                    td_errors = (td_errors - td_errors.mean()) / (
+                        td_errors.std() + 1e-6
+                    )
                     _, policy_mlmc_grads_t = actor_loss_grad_fn(
                         policy_state.params, observations, actions, td_errors
                     )  # t
@@ -515,9 +440,9 @@ def run_actorcritic_experiment_montecarlo(
                 sample_counter += batchsize_bound
         else:
             sample_counter += batchsize_bound
-
             (observation, env_state, env_params, key, policy_state, _), (
                 observations,
+                next_observations,
                 actions,
                 rewards,
                 dones,
@@ -536,19 +461,9 @@ def run_actorcritic_experiment_montecarlo(
                 length=jnp.minimum(max_t, batchsize_bound),
             )
 
-            (av_reward_loss_value, av_rewards), reward_tracker_grads = (
-                reward_tracker_grad_fn(reward_tracker_state.params, rewards)
-            )
-
-            returns = _calculate_returns(rewards, dones)
-
             (critic_loss_value, td_errors), critic_grads = critic_loss_grad_fn(
-                critic_state.params,
-                returns,
-                observations,
-                av_rewards,
+                critic_state.params, rewards, observations, next_observations, dones
             )
-
             td_errors = (td_errors - td_errors.mean()) / (td_errors.std() + 1e-6)
 
             actor_loss_value, policy_grads = actor_loss_grad_fn(
@@ -556,20 +471,15 @@ def run_actorcritic_experiment_montecarlo(
             )
 
         actor_grad_norm = optax.global_norm(policy_grads)
-        critic_grad_norm = optax.global_norm(critic_grads)
+        critic_grad_rorm = optax.global_norm(critic_grads)
 
         policy_state = policy_state.apply_gradients(grads=policy_grads)
         critic_state = critic_state.apply_gradients(grads=critic_grads)
-        reward_tracker_state = reward_tracker_state.apply_gradients(
-            grads=reward_tracker_grads
-        )
-
         return (
-            (actor_loss_value, critic_loss_value, av_rewards),
-            (actor_grad_norm, critic_grad_norm),
+            (actor_loss_value, critic_loss_value),
+            (actor_grad_norm, critic_grad_rorm),
             policy_state,
             critic_state,
-            reward_tracker_state,
             observation,
             env_state,
             key,
@@ -589,7 +499,6 @@ def run_actorcritic_experiment_montecarlo(
             grad_norm,
             policy_state,
             critic_state,
-            reward_tracker_state,
             state,
             env_state,
             key,
@@ -597,7 +506,6 @@ def run_actorcritic_experiment_montecarlo(
         ) = ac_update(
             policy_state,
             critic_state,
-            reward_tracker_state,
             env_state,
             env_params,
             state,
@@ -608,6 +516,7 @@ def run_actorcritic_experiment_montecarlo(
 
         scores_deque.append(env_state.returned_episode_returns)
         lengths_deque.append(env_state.returned_episode_lengths)
+
         if "pogema" in env_id:
             metrics_deque.append(env_state.returned_episode_metrics)
 
@@ -615,13 +524,11 @@ def run_actorcritic_experiment_montecarlo(
             {
                 "Actor_Grad_Norm": grad_norm[0].mean().item(),
                 "Critic_Grad_Norm": grad_norm[1].mean().item(),
-                "Average_Reward_Tracker": loss[2].mean().item(),
                 "Value_Loss": loss[1].mean().item(),
                 "Policy_Loss": loss[0].mean().item(),
                 "Step": i_episode,
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
-                f"Episode_{metrics_key}": np.mean(metrics_deque),
                 "env_steps": sample_counter,
             }
         )
@@ -635,11 +542,10 @@ def main(cfg: DictConfig) -> None:
         project=cfg.wandb.project,
     )
 
-    wandb.define_metric("env_steps")
-
     wandb.config = dict_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
     )
+    wandb.define_metric("env_steps")
 
     optimisers = {
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),
@@ -662,14 +568,9 @@ def main(cfg: DictConfig) -> None:
         optax.clip_by_global_norm(1000.0), optimisers[dict_config["critic_optimiser"]]
     )
 
-    reward_optimiser = optax.chain(
-        optax.clip_by_global_norm(1000.0), optimisers[dict_config["critic_optimiser"]]
-    )
-
-    run_actorcritic_experiment_montecarlo(
+    run_actorcritic_experiment_td0(
         actor_optimiser=actor_optimiser,
         critic_optimiser=critic_optimiser,
-        reward_optimiser=reward_optimiser,
         **dict_config["experiment"],
         seed=dict_config["seed"],
     )

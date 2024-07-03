@@ -16,9 +16,6 @@ from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
-from optax import scale_by_learning_rate
-from optax._src.numerics import abs_sq as _abs_sq
-from optax.tree_utils import tree_add
 from pogema.envs import _make_pogema
 from pogema.grid_config import GridConfig
 from pogema.integrations.sample_factory import AutoResetWrapper

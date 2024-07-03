@@ -16,7 +16,6 @@ Repository structure
 |   |   |-- config.yaml
 |   |   |-- experiment.py
 |   |   |-- sweep_config.yaml
-|   |   |-- sweep_config_batch.yaml
 |   |-- continual_td0
 |   |   |-- config.yaml
 |   |   |-- experiment.py
@@ -24,12 +23,15 @@ Repository structure
 |   |-- discounted_ac
 |   |   |-- config.yaml
 |   |   |-- experiment.py
-|   |   `-- sweep_config.yaml
-|   `-- discounted_ppo
+|   |   |-- sweep_config.yaml
+|   |-- discounted_ppo
+|   |   |-- config.yaml
+|   |   |-- experiment.py
+|   |   |-- sweep_config.yaml
+|   `-- discounted_td0
 |       |-- config.yaml
 |       |-- experiment.py
 |       |-- sweep_config.yaml
-|       |-- sweep_config_batch.yaml
 |-- reinforce
 |   |-- continual
 |   |   |-- config.yaml
@@ -38,7 +40,6 @@ Repository structure
 |   `-- discounted
 |       |-- config.yaml
 |       |-- experiment.py
-|       `-- sweep_config.yaml
-`-- requirements.txt
+|       |-- sweep_config.yaml
 ```
 
