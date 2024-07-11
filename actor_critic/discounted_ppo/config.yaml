@@ -12,8 +12,8 @@ anneal_lr: false
 
 experiment:
   env_id: CartPole-v1
-  n_training_episodes: 10000
-  batchsize_bound: 6
+  n_training_episodes: 100000
+  batchsize_bound: 100
   max_t: 500
   batchsize_limit: 32
   gamma: 0.99
@@ -27,7 +27,7 @@ experiment:
     on_target: restart
     size: 8  # size of the grid
     density: 0.0  # obstacle density
-    max_episode_steps: 64  # horizon
+    max_episode_steps: 128  # horizon
     obs_radius: 1  # defines field of view
 
 wandb:

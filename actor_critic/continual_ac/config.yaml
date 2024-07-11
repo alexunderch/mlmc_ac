@@ -13,10 +13,10 @@ learning_rate: 1.E-3
 
 experiment:
   env_id: CartPole-v1
-  n_training_episodes: 2000
-  batchsize_bound: 250
+  n_training_episodes: 10000
+  batchsize_bound: 100
   max_t: 500
-  batchsize_limit: 16
+  batchsize_limit: 32
   mlmc_correction_actor: false
   mlmc_correction_critic: false
   total_samples: null
@@ -24,7 +24,7 @@ experiment:
     on_target: restart
     size: 8  # size of the grid
     density: 0.0  # obstacle density
-    max_episode_steps: 64  # horizon
+    max_episode_steps: 128  # horizon
     obs_radius: 1  # defines field of view
 wandb:
   project: MLMCOptimiser 

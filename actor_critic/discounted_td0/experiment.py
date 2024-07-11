@@ -285,7 +285,7 @@ def run_actorcritic_experiment_td0(
     init_actor_key, init_critic_key, reset_key, key = jax.random.split(
         jax.random.key(seed), 4
     )
-    initial_obs, env_state = env.reset(reset_key, env_params)
+    initial_obs, env_state = jit_reset(reset_key, env_params)
 
     policy_state = TrainState.create(
         apply_fn=jax.jit(policy.apply),
@@ -529,6 +529,7 @@ def run_actorcritic_experiment_td0(
                 "Step": i_episode,
                 "Episode_Return": np.mean(scores_deque),
                 "Episode_Length": np.mean(lengths_deque),
+                f"Episode_{metrics_key}": np.mean(metrics_deque),
                 "env_steps": sample_counter,
             }
         )

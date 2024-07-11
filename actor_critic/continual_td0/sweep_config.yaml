@@ -6,14 +6,23 @@ metric:
   name: Episode_Return
 
 parameters:
+  experiment.total_samples: 
+    values: [1.E+6]
+  experiment.batchsize_bound: 
+    values: [4]
+  experiment.env_id:
+    values: [pogema, CartPole-v1, Acrobot-v1]
   critic_optimiser:
-    values: [adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
+    values: [projected_mirror_descent, accelerated_sgd] #[adam, adagrad, sgd, accelerated_sgd, accelerated_sgd_adagrad]
+  actor_optimiser:
+    values: [projected_mirror_descent, accelerated_sgd] #[adam, adagrad, sgd]
   experiment.mlmc_correction_actor:
     values: [true, false]
   experiment.mlmc_correction_critic:
     values: [true, false]
   seed:
     values: [1, 11, 111]
+
 
 command:
 - ${env}

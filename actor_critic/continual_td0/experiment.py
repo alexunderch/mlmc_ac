@@ -16,9 +16,7 @@ from distrax import Categorical
 from flax import linen as nn
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
-from optax import scale_by_learning_rate
-from optax._src.numerics import abs_sq as _abs_sq
-from optax.tree_utils import tree_add
+from optax.tree_utils import tree_l2_norm, tree_scalar_mul, tree_sub
 from pogema.envs import _make_pogema
 from pogema.grid_config import GridConfig
 from pogema.integrations.sample_factory import AutoResetWrapper
@@ -65,7 +63,7 @@ def accelerated_trace(
 
     accumulator_dtype = utils.canonicalize_dtype(accumulator_dtype)
 
-    def init_fn(params):
+    def init_fn(params) -> AcceleratedTraceState:
         return AcceleratedTraceState(
             count=jnp.zeros((), dtype=jnp.int32), trace_f=params
         )
@@ -103,6 +101,69 @@ def accelerated_trace(
     return base.GradientTransformation(init_fn, update_fn)
 
 
+def projection_l2_ball(x: Any, max_value: float = 1.0) -> Any:
+    r"""Projection onto the l2 ball:
+
+    .. math::
+
+      \underset{y}{\text{argmin}} ~ ||x - y||_2^2 \quad \textrm{subject to} \quad
+      ||y||_2 \le \text{max_value}
+
+    Args:
+      x: pytree to project.
+      max_value: radius of the ball.
+
+    Returns:
+      output pytree, with the same structure as ``x``.
+    """
+    l2_norm = tree_l2_norm(x)
+    factor = max_value / l2_norm
+    return jax.lax.cond(
+        l2_norm <= max_value,
+        lambda _: x,
+        lambda _: tree_scalar_mul(factor, x),
+        operand=None,
+    )
+
+
+class PMDState(NamedTuple):
+    """State for the Adam algorithm."""
+
+    count: jax.Array  # shape=(), dtype=jnp.int32.
+
+
+def projected_mirror_descent(
+    learning_rate: float,
+) -> base.GradientTransformation:
+    """
+    Adapted using https://www.cs.ubc.ca/~nickhar/F18-531/Notes20.pdf
+    """
+
+    # dual_projection_grad = lambda y: jax.tree.map(
+    #     lambda x: 0.5 * jnp.linalg.norm(x, ord=2, keepdims=True), y
+    # )
+    primal_projection_grad = dual_projection_grad = projection_l2_ball
+
+    def init_fn(params) -> PMDState:
+        return PMDState(count=jnp.zeros((), dtype=jnp.int32))
+
+    def update_fn(updates, state, params):
+        count = state.count
+        projected_params = dual_projection_grad(params)
+
+        updated_params = jax.tree_util.tree_map(
+            lambda x, g: tree_sub(x, tree_scalar_mul(learning_rate, g)),
+            projected_params,
+            updates,
+        )
+        recovered_params = primal_projection_grad(updated_params)
+        updates = tree_sub(recovered_params, params)
+
+        return updates, PMDState(count=count + 1)
+
+    return base.GradientTransformation(init_fn, update_fn)
+
+
 def run_actorcritic_experiment_td0(
     env_id: str,
     actor_optimiser: optax.GradientTransformation,
@@ -118,7 +179,6 @@ def run_actorcritic_experiment_td0(
     total_samples: Optional[int] = None,
     env_kwargs: Optional[dict] = None,
 ):
-    # env = make(env_id, max_episode_steps=max_t)
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
@@ -646,6 +706,9 @@ def main(cfg: DictConfig) -> None:
         "accelerated_sgd_adagrad": optax.chain(
             optax.scale_by_rss(),
             accelerated_trace(learning_rate=lambda t: 0.1, **dict_config["momentum"]),
+        ),
+        "projected_mirror_descent": projected_mirror_descent(
+            learning_rate=dict_config["learning_rate"]
         ),
     }
 
