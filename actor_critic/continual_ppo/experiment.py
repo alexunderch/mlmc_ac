@@ -369,10 +369,11 @@ def run_actorcritic_experiment_ppo(
         log_prob = pi.log_prob(traj_batch.action)
 
         # CALCULATE VALUE LOSS
+        value = value - av_value * av_vf_coeff
+
         value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
             -clip_eps, clip_eps
         )
-        value = value - av_value * av_vf_coeff
         value_losses = jnp.square(value - targets)
         value_losses_clipped = jnp.square(value_pred_clipped - targets)
         value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()

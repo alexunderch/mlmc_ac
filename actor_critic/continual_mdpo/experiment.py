@@ -1,3 +1,4 @@
+import functools
 import warnings
 from collections import deque
 from typing import Any, Callable, Literal, NamedTuple, Optional
@@ -5,6 +6,7 @@ from typing import Any, Callable, Literal, NamedTuple, Optional
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import navix as nx
 import numpy as np
 import optax
 import optax._src.base as base
@@ -14,6 +16,7 @@ from distrax._src.utils import math
 from flax import linen as nn
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
+from gymnax.environments import spaces
 from pogema.envs import _make_pogema
 from pogema.grid_config import GridConfig
 from pogema.integrations.sample_factory import AutoResetWrapper
@@ -27,6 +30,36 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 
 DEBUG_POGEMA = False
+
+
+class NavixGymnaxWrapper:
+    def __init__(self, env_name):
+        self._env = nx.make(env_name)
+
+    def reset(self, key, params=None):
+        timestep = self._env.reset(key)
+        return timestep.observation, timestep
+
+    def step(self, key, state, action, params=None):
+        timestep = self._env.step(state, action)
+        return timestep.observation, timestep, timestep.reward, timestep.is_done(), {}
+
+    def observation_space(self, params):
+        return spaces.Box(
+            low=self._env.observation_space.minimum,
+            high=self._env.observation_space.maximum,
+            shape=(np.prod(self._env.observation_space.shape),),
+            dtype=self._env.observation_space.dtype,
+        )
+
+    def action_space(self, params):
+        return spaces.Discrete(
+            num_categories=self._env.action_space.maximum.item() + 1,
+        )
+
+    @property
+    def num_actions(self):
+        return self._env.action_space.maximum.item() + 1
 
 
 class Transition(NamedTuple):
@@ -128,7 +161,7 @@ def _projection_unit_simplex_jvp(primals, tangents):
     primal_out = _projection_unit_simplex(x)
     supp = primal_out > 0
     card = jnp.count_nonzero(supp)
-    tangent_out = supp * x_dot - (jnp.dot(supp, x_dot) / card) * supp
+    tangent_out = jnp.dot(jnp.diag(supp) - jnp.outer(supp, supp) / card, x_dot)
     return primal_out, tangent_out
 
 
@@ -162,7 +195,9 @@ def run_actorcritic_experiment_mdpo(
     max_t: int,
     gae_lambda: float,
     vf_coeff: float,
+    ent_coeff: float,
     av_vf_coeff: float,
+    clip_eps: float,
     seed: int,
     batchsize_bound: int,
     batchsize_limit: int,
@@ -199,14 +234,9 @@ def run_actorcritic_experiment_mdpo(
         action_logits, value = policy_state.apply_fn(
             {"params": policy_state.params}, observations
         )
-
-        pi = projection_simplex(action_logits)
-        action = jax.random.choice(
-            a=jnp.arange(0, pi.shape[-1], 1),
-            key=key,
-            p=pi,
-        )
-        log_prob = jnp.log(pi[action])
+        pi = Categorical(probs=projection_simplex(action_logits))
+        action = pi.sample(seed=key)
+        log_prob = pi.log_prob(action)
         return action, log_prob, value
 
     if projection == "simplex":
@@ -216,10 +246,40 @@ def run_actorcritic_experiment_mdpo(
 
     @jax.jit
     def value(policy_state, observations):
+        observations = jnp.reshape(observations, (-1,))
         _, value = policy_state.apply_fn({"params": policy_state.params}, observations)
         return value
 
-    if "pogema" not in env_id:
+    if "navix" in env_id:
+        metrics_key = "Nil"
+        _, env_name = env_id.split(":")
+        env, env_params = NavixGymnaxWrapper(env_name), None
+        env = gymnax.wrappers.LogWrapper(env)
+
+        jit_step = jax.jit(env.step)
+        jit_reset = jax.jit(env.reset)
+
+        def step_fn(carry, _):
+            state, env_state, env_params, step_key, policy_state, ep_len = carry
+            env_step_key, act_key, key = jax.random.split(step_key, 3)
+            state = jnp.reshape(state, (-1,))
+            action, log_prob, value = act(policy_state, state, act_key)
+            next_state, new_env_state, reward, done, info = jit_step(
+                env_step_key, env_state, action, env_params
+            )
+            return (
+                (
+                    next_state,
+                    new_env_state,
+                    env_params,
+                    key,
+                    policy_state,
+                    ep_len + (1 - done.astype(jnp.int32)),
+                ),
+                Transition(state, action, log_prob, reward, value, done, info),
+            )
+
+    elif "pogema" not in env_id:
         metrics_key = "Nil"
         env, env_params = gymnax.make(env_id)
         env = gymnax.wrappers.LogWrapper(env)
@@ -358,9 +418,44 @@ def run_actorcritic_experiment_mdpo(
         @nn.compact
         def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
             policy_logits = nn.Sequential([nn.Dense(features=self.num_actions)])(x)
-            values = nn.Sequential([nn.Dense(1), lambda x: jnp.squeeze(x, -1)])(x)
+            values = nn.Sequential([nn.Dense(1)])(x)
+            # policy_logits = nn.Dense(
+            #     64,
+            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(x)
+            # policy_logits = nn.tanh(policy_logits)
+            # policy_logits = nn.Dense(
+            #     64,
+            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(policy_logits)
+            # policy_logits = nn.tanh(policy_logits)
+            # policy_logits = nn.Dense(
+            #     self.num_actions,
+            #     kernel_init=nn.initializers.orthogonal(0.01),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(policy_logits)
 
-            return policy_logits, values
+            # values = nn.Dense(
+            #     64,
+            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(x)
+            # values = nn.tanh(values)
+            # values = nn.Dense(
+            #     64,
+            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(values)
+            # values = nn.tanh(values)
+            # values = nn.Dense(
+            #     1,
+            #     kernel_init=nn.initializers.orthogonal(1.0),
+            #     bias_init=nn.initializers.constant(0.0),
+            # )(values)
+
+            return policy_logits, jnp.squeeze(values, axis=-1)
 
     class Tracker(nn.Module):
         output_dim: int
@@ -389,6 +484,7 @@ def run_actorcritic_experiment_mdpo(
         jax.random.key(seed), 4
     )
     initial_obs, env_state = jit_reset(reset_key, env_params)
+    initial_obs = jnp.reshape(initial_obs, (-1,))
 
     policy_state = TrainState.create(
         apply_fn=jax.jit(network.apply),
@@ -429,40 +525,52 @@ def run_actorcritic_experiment_mdpo(
     def _loss_fn(params, temperature, traj_batch, gae, targets, av_value):
         # GRAIDENT OPTIMISATION PART
         # RERUN NETWORK
-        action_logits, value = network.apply({"params": params}, traj_batch.observation)
+        action_logits, value = policy_state.apply_fn(
+            {"params": params}, traj_batch.observation
+        )
 
         if projection == "simplex":
-            pi = jax.vmap(projection_simplex)(action_logits)
-            value_one_hot = jax.nn.one_hot(traj_batch.action, action_logits.shape[-1])
-            mask_outside_domain = jnp.logical_or(
-                traj_batch.action < 0, traj_batch.action > action_logits.shape[-1] - 1
-            )
-            log_prob = jnp.where(
-                mask_outside_domain,
-                -jnp.inf,
-                jnp.sum(math.multiply_no_nan(pi, value_one_hot), axis=-1),
-            )
+            # jax.debug.print(
+            # "{y}\t{x}", y=action_logits[0], x=projection_simplex(action_logits[0])
+            # )
+            # pi = Categorical(probs=jax.vmap(projection_simplex)(action_logits))
+            # jax.debug.print("{x}", x=pi.probs[0])
+            pi = Categorical(logits=action_logits)
 
-            entropy = -(jnp.exp(log_prob) * log_prob).mean()
         elif projection == "softmax":
             pi = Categorical(logits=action_logits)
-            log_prob = pi.log_prob(traj_batch.action)
-            entropy = pi.entropy().mean()
+
+        log_prob = pi.log_prob(traj_batch.action)
+        entropy = jnp.nanmean(pi.entropy())
 
         # CALCULATE VALUE LOSS
         value = value - av_value * av_vf_coeff
-        value_loss = 0.5 * jnp.square(value - targets).mean()
+        value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
+            -clip_eps, clip_eps
+        )
+        value_losses = jnp.square(value - targets)
+        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+        value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
         # CALCULATE ACTOR LOSS
-        kl = jnp.dot(jnp.exp(log_prob), log_prob - traj_batch.log_prob)
+        kl = jnp.sum(jnp.exp(log_prob) * (log_prob - traj_batch.log_prob), axis=0)
+        ratio = jnp.exp(log_prob - traj_batch.log_prob)
         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-        loss_actor1 = -log_prob * gae
-
-        loss_actor = loss_actor1 + temperature * kl
+        loss_actor1 = ratio * gae
+        loss_actor2 = (
+            jnp.clip(
+                ratio,
+                1.0 - clip_eps,
+                1.0 + clip_eps,
+            )
+            * gae
+        )
+        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+        loss_actor = loss_actor + temperature * kl
         loss_actor = loss_actor.mean()
 
-        total_loss = loss_actor + vf_coeff * value_loss
-        return total_loss, (value_loss, loss_actor, entropy)
+        total_loss = loss_actor + vf_coeff * value_loss - ent_coeff * entropy
+        return total_loss, (value_loss, loss_actor, entropy, kl)
 
     @jax.jit
     def _av_reward_tracker_loss_fn(params, returns, values):
@@ -476,7 +584,7 @@ def run_actorcritic_experiment_mdpo(
             (av_reward, jnp.tile(av_value, values.shape)),
         )
 
-    def ppo_update(
+    def _update(
         policy_state,
         tracker_state,
         observation,
@@ -488,7 +596,10 @@ def run_actorcritic_experiment_mdpo(
         update_counter,
     ):
 
-        loss_grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+        loss_grad_fn = jax.value_and_grad(
+            _loss_fn,
+            has_aux=True,
+        )
         reward_tracker_grad_fn = jax.value_and_grad(
             _av_reward_tracker_loss_fn, has_aux=True
         )
@@ -535,7 +646,7 @@ def run_actorcritic_experiment_mdpo(
             last_val = value(policy_state, observation)
             advantages, targets = _calculate_gae(traj_batch, av_reward, last_val)
 
-            (loss_value, (value_loss, loss_actor, entropy)), grads = loss_grad_fn(
+            (loss_value, (value_loss, loss_actor, entropy, kl)), grads = loss_grad_fn(
                 policy_state.params,
                 temperature_schedule(update_counter),
                 jax.tree.map(lambda x: x[:batchsize_bound], traj_batch),
@@ -552,13 +663,15 @@ def run_actorcritic_experiment_mdpo(
                     tracker_state.params, traj_batch.reward, traj_batch.value
                 )
 
-                _, mlmc_grads_t = loss_grad_fn(
-                    policy_state.params,
-                    temperature_schedule(update_counter),
-                    traj_batch,
-                    advantages,
-                    targets,
-                    av_value,
+                (loss_value, (value_loss, loss_actor, entropy, kl)), mlmc_grads_t = (
+                    loss_grad_fn(
+                        policy_state.params,
+                        temperature_schedule(update_counter),
+                        traj_batch,
+                        advantages,
+                        targets,
+                        av_value,
+                    )
                 )  # t
 
                 _, tracker_grads_tm1 = reward_tracker_grad_fn(
@@ -617,7 +730,7 @@ def run_actorcritic_experiment_mdpo(
             last_val = value(policy_state, observation)
             advantages, targets = _calculate_gae(traj_batch, av_reward, last_val)
 
-            (loss_value, (value_loss, loss_actor, entropy)), grads = loss_grad_fn(
+            (loss_value, (value_loss, loss_actor, entropy, kl)), grads = loss_grad_fn(
                 policy_state.params,
                 temperature_schedule(update_counter),
                 traj_batch,
@@ -634,7 +747,7 @@ def run_actorcritic_experiment_mdpo(
             grad_norm,
             policy_state,
             tracker_state,
-            (value_loss, loss_actor, entropy),
+            (value_loss, loss_actor, entropy, kl),
             observation,
             env_state,
             key,
@@ -654,12 +767,12 @@ def run_actorcritic_experiment_mdpo(
             grad_norm,
             policy_state,
             tracker_state,
-            (value_loss, actor_loss, entropy),
+            (value_loss, actor_loss, entropy, kl),
             state,
             env_state,
             key,
             sample_counter,
-        ) = ppo_update(
+        ) = _update(
             policy_state,
             tracker_state,
             state,
@@ -684,6 +797,7 @@ def run_actorcritic_experiment_mdpo(
                 "Grad_Norm": grad_norm.mean().item(),
                 "Average_Reward_Tracker": loss[1].mean().item(),
                 "Average_Value_Tracker": loss[2].mean().item(),
+                "KL": kl.mean().item(),
                 "Value_Loss": value_loss.mean().item(),
                 "Policy_Loss": actor_loss.mean().item(),
                 "Entropy": entropy.mean().item(),
@@ -747,7 +861,6 @@ def main(cfg: DictConfig) -> None:
     opt_tracker = optax.chain(
         optax.clip_by_global_norm(1000.0), tracker_optimisers[dict_config["optimiser"]]
     )
-
     run_actorcritic_experiment_mdpo(
         optimiser=opt,
         av_tracker_optimiser=opt_tracker,
