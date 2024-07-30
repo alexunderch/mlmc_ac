@@ -7,17 +7,17 @@ momentum:
   decay_beta: 0.15
   decay_p: 0.48
 
-learning_rate: 3.E-3
-alpha: 1.E-2
+learning_rate: 3.E-4
+alpha: 3.E-4
 anneal_lr: false
 
 experiment:
-  env_id: navix:Navix-Empty-8x8-v0 #CartPole-v1
+  env_id: "navix:Navix-DoorKey-5x5-v0" # navix:Navix-Empty-8x8-v0 #CartPole-v1
   n_training_episodes: 100000
   batchsize_bound: 128
   max_t: 500
   batchsize_limit: 64
-  gae_lambda: 0.99
+  gae_lambda: 0.999
   vf_coeff: 0.5
   clip_eps: 0.2
   ent_coeff: 0.01

@@ -77,7 +77,7 @@ def accelerated_trace(
 
     def update_fn(updates, state, params):
         count = state.count
-        mul_by_alpha = lambda alpha, x: jax.tree_util.tree_map(lambda y: alpha * y, x)
+        mul_by_alpha = lambda alpha, x: jax.tree_util.tree_map(lambda y: alpha * y, x) # noqa: E731
 
         trace_g = jax.tree_util.tree_map(
             lambda x, x_f: mul_by_alpha(decay_theta, x_f)
@@ -86,7 +86,7 @@ def accelerated_trace(
             state.trace_f,
         )
 
-        trace_f_update_fn = lambda g, t: t - decay_p * learning_rate(count) * g
+        trace_f_update_fn = lambda g, t: t - decay_p * learning_rate(count) * g  # noqa: E731
         new_trace_f = jax.tree_util.tree_map(trace_f_update_fn, updates, trace_g)
 
         updates = jax.tree_util.tree_map(

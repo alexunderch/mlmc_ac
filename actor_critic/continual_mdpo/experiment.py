@@ -3,6 +3,13 @@ import warnings
 from collections import deque
 from typing import Any, Callable, Literal, NamedTuple, Optional
 
+import gymnax
+from gymnax.environments import spaces
+import gymnax.wrappers
+import hydra
+import wandb
+from omegaconf import DictConfig, OmegaConf
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -16,18 +23,12 @@ from distrax._src.utils import math
 from flax import linen as nn
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
-from gymnax.environments import spaces
-from pogema.envs import _make_pogema
-from pogema.grid_config import GridConfig
-from pogema.integrations.sample_factory import AutoResetWrapper
+# from pogema.envs import _make_pogema
+# from pogema.grid_config import GridConfig
+# from pogema.integrations.sample_factory import AutoResetWrapper
 
 warnings.filterwarnings("ignore")
 
-import gymnax
-import gymnax.wrappers
-import hydra
-import wandb
-from omegaconf import DictConfig, OmegaConf
 
 DEBUG_POGEMA = False
 
@@ -73,8 +74,7 @@ class Transition(NamedTuple):
 
 
 def isr_decay(initial_value: float) -> base.Schedule:
-    """Constructs a square root decaying schedule.
-
+    """
     Args:
       initial_value: value to decay from.
 
@@ -82,7 +82,7 @@ def isr_decay(initial_value: float) -> base.Schedule:
       schedule
         A function that maps step counts to values.
     """
-    return lambda count: initial_value / jnp.sqrt(count + 1.0)
+    return lambda count: initial_value / (count + 1.0)
 
 
 class AcceleratedTraceState(NamedTuple):
@@ -417,43 +417,43 @@ def run_actorcritic_experiment_mdpo(
 
         @nn.compact
         def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            policy_logits = nn.Sequential([nn.Dense(features=self.num_actions)])(x)
-            values = nn.Sequential([nn.Dense(1)])(x)
-            # policy_logits = nn.Dense(
-            #     64,
-            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(x)
-            # policy_logits = nn.tanh(policy_logits)
-            # policy_logits = nn.Dense(
-            #     64,
-            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(policy_logits)
-            # policy_logits = nn.tanh(policy_logits)
-            # policy_logits = nn.Dense(
-            #     self.num_actions,
-            #     kernel_init=nn.initializers.orthogonal(0.01),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(policy_logits)
+            # policy_logits = nn.Sequential([nn.Dense(features=self.num_actions)])(x)
+            # values = nn.Sequential([nn.Dense(1)])(x)
+            policy_logits = nn.Dense(
+                64,
+                kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+                bias_init=nn.initializers.constant(0.0),
+            )(x)
+            policy_logits = nn.tanh(policy_logits)
+            policy_logits = nn.Dense(
+                64,
+                kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+                bias_init=nn.initializers.constant(0.0),
+            )(policy_logits)
+            policy_logits = nn.tanh(policy_logits)
+            policy_logits = nn.Dense(
+                self.num_actions,
+                kernel_init=nn.initializers.orthogonal(0.01),
+                bias_init=nn.initializers.constant(0.0),
+            )(policy_logits)
 
-            # values = nn.Dense(
-            #     64,
-            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(x)
-            # values = nn.tanh(values)
-            # values = nn.Dense(
-            #     64,
-            #     kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(values)
-            # values = nn.tanh(values)
-            # values = nn.Dense(
-            #     1,
-            #     kernel_init=nn.initializers.orthogonal(1.0),
-            #     bias_init=nn.initializers.constant(0.0),
-            # )(values)
+            values = nn.Dense(
+                64,
+                kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+                bias_init=nn.initializers.constant(0.0),
+            )(x)
+            values = nn.tanh(values)
+            values = nn.Dense(
+                64,
+                kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
+                bias_init=nn.initializers.constant(0.0),
+            )(values)
+            values = nn.tanh(values)
+            values = nn.Dense(
+                1,
+                kernel_init=nn.initializers.orthogonal(1.0),
+                bias_init=nn.initializers.constant(0.0),
+            )(values)
 
             return policy_logits, jnp.squeeze(values, axis=-1)
 
@@ -533,9 +533,9 @@ def run_actorcritic_experiment_mdpo(
             # jax.debug.print(
             # "{y}\t{x}", y=action_logits[0], x=projection_simplex(action_logits[0])
             # )
-            # pi = Categorical(probs=jax.vmap(projection_simplex)(action_logits))
+            pi = Categorical(probs=jax.vmap(projection_simplex)(action_logits))
             # jax.debug.print("{x}", x=pi.probs[0])
-            pi = Categorical(logits=action_logits)
+            # pi = Categorical(logits=action_logits)
 
         elif projection == "softmax":
             pi = Categorical(logits=action_logits)
@@ -553,8 +553,8 @@ def run_actorcritic_experiment_mdpo(
         value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
         # CALCULATE ACTOR LOSS
-        kl = jnp.sum(jnp.exp(log_prob) * (log_prob - traj_batch.log_prob), axis=0)
-        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+        logratio = log_prob - traj_batch.log_prob
+        ratio = jnp.exp(logratio)
         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
         loss_actor1 = ratio * gae
         loss_actor2 = (
@@ -566,11 +566,11 @@ def run_actorcritic_experiment_mdpo(
             * gae
         )
         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-        loss_actor = loss_actor + temperature * kl
+        loss_actor = loss_actor + temperature * logratio
         loss_actor = loss_actor.mean()
 
         total_loss = loss_actor + vf_coeff * value_loss - ent_coeff * entropy
-        return total_loss, (value_loss, loss_actor, entropy, kl)
+        return total_loss, (value_loss, loss_actor, entropy, logratio.mean())
 
     @jax.jit
     def _av_reward_tracker_loss_fn(params, returns, values):
@@ -738,7 +738,8 @@ def run_actorcritic_experiment_mdpo(
                 targets,
                 av_value,
             )
-
+        
+        # jax.debug.print("{x}", x=grads)
         policy_state = policy_state.apply_gradients(grads=grads)
         tracker_state = tracker_state.apply_gradients(grads=tracker_grads)
         grad_norm = optax.global_norm(grads)
