@@ -13,8 +13,9 @@ anneal_lr: false
 
 experiment:
   env_id: "navix:Navix-DoorKey-5x5-v0" # navix:Navix-Empty-8x8-v0 #CartPole-v1
+  num_envs: 3
   n_training_episodes: 100000
-  batchsize_bound: 128
+  batchsize_bound: 32
   max_t: 500
   batchsize_limit: 64
   gae_lambda: 0.999

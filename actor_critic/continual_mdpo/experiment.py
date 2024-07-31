@@ -188,6 +188,7 @@ def projection_simplex(x: jnp.ndarray, value: float = 1.0) -> jnp.ndarray:
 
 def run_actorcritic_experiment_mdpo(
     env_id: str,
+    num_envs: int,
     optimiser: optax.GradientTransformation,
     av_tracker_optimiser: optax.GradientTransformation,
     projection: Literal["softmax", "simplex"],
@@ -208,12 +209,17 @@ def run_actorcritic_experiment_mdpo(
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
+    batchsize_bound *= num_envs
+
 
     total_samples: int = (
         int(total_samples)
         if total_samples is not None
         else batchsize_bound * n_training_episodes
     )
+
+    total_samples /= num_envs
+    n_training_episodes /= num_envs
 
     sample_counter: int = 0
     stopping_criterium = lambda k: k > total_samples
@@ -256,16 +262,17 @@ def run_actorcritic_experiment_mdpo(
         env, env_params = NavixGymnaxWrapper(env_name), None
         env = gymnax.wrappers.LogWrapper(env)
 
-        jit_step = jax.jit(env.step)
-        jit_reset = jax.jit(env.reset)
+        jit_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, None)))
+        jit_reset = jax.jit(jax.vmap(env.reset, in_axes=(0, None)))
 
         def step_fn(carry, _):
             state, env_state, env_params, step_key, policy_state, ep_len = carry
             env_step_key, act_key, key = jax.random.split(step_key, 3)
-            state = jnp.reshape(state, (-1,))
+            state = jnp.reshape(state, (num_envs, -1))
+            env_step_keys = jax.random.split(env_step_key, config["NUM_ENVS"])
             action, log_prob, value = act(policy_state, state, act_key)
             next_state, new_env_state, reward, done, info = jit_step(
-                env_step_key, env_state, action, env_params
+                env_step_keys, env_state, action, env_params
             )
             return (
                 (
@@ -617,8 +624,8 @@ def run_actorcritic_experiment_mdpo(
                 ).item()
             )
 
-            J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound)), int(
-                jnp.ceil((2 ** (J - 1)) * batchsize_bound)
+            J_t, J_tm1 = int(jnp.ceil((2**J) * batchsize_bound * num_envs)), int(
+                jnp.ceil((2 ** (J - 1)) * batchsize_bound * num_envs)
             )
             (observation, env_state, env_params, key, policy_state, _), traj_batch = (
                 jax.lax.scan(
@@ -637,13 +644,15 @@ def run_actorcritic_experiment_mdpo(
                 )
             )
 
+            traj_batch = jax.tree.map(lambda x: jnp.reshape(x, (num_envs*J_t, -1)), traj_batch)
+
             (_, (av_reward, av_value)), tracker_grads = reward_tracker_grad_fn(
                 tracker_state.params,
                 traj_batch.reward[:batchsize_bound],
                 traj_batch.value[:batchsize_bound],
             )
 
-            last_val = value(policy_state, observation)
+            last_val = value(policy_state, observation.reshape((num_envs*batchsize_bound, -1)))
             advantages, targets = _calculate_gae(traj_batch, av_reward, last_val)
 
             (loss_value, (value_loss, loss_actor, entropy, kl)), grads = loss_grad_fn(
@@ -657,7 +666,7 @@ def run_actorcritic_experiment_mdpo(
 
             # mlmc batch_size
             if 2**J <= batchsize_limit and J > 0:
-                sample_counter += J_t
+                sample_counter += J_t 
 
                 (_, (av_reward, av_value)), tracker_grads_t = reward_tracker_grad_fn(
                     tracker_state.params, traj_batch.reward, traj_batch.value
@@ -703,9 +712,9 @@ def run_actorcritic_experiment_mdpo(
                     tracker_grads_tm1,
                 )
             else:
-                sample_counter += batchsize_bound
+                sample_counter += batchsize_bound 
         else:
-            sample_counter += batchsize_bound
+            sample_counter += batchsize_bound 
 
             (observation, env_state, env_params, key, policy_state, _), traj_batch = (
                 jax.lax.scan(
@@ -723,11 +732,13 @@ def run_actorcritic_experiment_mdpo(
                 )
             )
 
+            traj_batch = jax.tree.map(lambda x: jnp.reshape(x, (num_envs * J_t, -1)), traj_batch)
+
             (_, (av_reward, av_value)), tracker_grads = reward_tracker_grad_fn(
                 tracker_state.params, traj_batch.reward, traj_batch.value
             )
 
-            last_val = value(policy_state, observation)
+            last_val = value(policy_state, observation.reshape((num_envs*batchsize_bound, -1)))
             advantages, targets = _calculate_gae(traj_batch, av_reward, last_val)
 
             (loss_value, (value_loss, loss_actor, entropy, kl)), grads = loss_grad_fn(
@@ -755,7 +766,7 @@ def run_actorcritic_experiment_mdpo(
             sample_counter,
         )
 
-    state, env_state = jit_reset(reset_key, env_params)
+    state, env_state = jit_reset(jax.random.split(reset_key, num_envs), env_params)
     update_counter = 0
     for i_episode in range(1, n_training_episodes + 1):
         loss_key, reset_key, step_key = jax.random.split(key, 3)
