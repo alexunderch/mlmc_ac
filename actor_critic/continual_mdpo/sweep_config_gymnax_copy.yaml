@@ -1,0 +1,30 @@
+program: experiment.py
+
+method: grid
+metric:
+  goal: maximize
+  name: Episode_Return
+
+parameters:
+  experiment.projection: 
+    values: [softmax] #["softmax", "simplex"]
+  experiment.num_envs:
+    values: [4]
+  experiment.gae_lambda: 
+    values: [0.0, 1.0] 
+  experiment.batchsize_bound: 
+    values: [32]
+  experiment.env_id:
+    values: [Acrobot-v1] 
+  optimiser:
+    values: [adam]
+  experiment.mlmc_correction:
+    values: [true, false]
+  seed:
+    values: [0, 1, 10, 11, 100]
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- ${args_no_hyphens}

@@ -1,5 +1,5 @@
 jax<0.4.26
-chex==0.1.7
+chex==0.1.86
 distrax
 flax<0.8.3
 optax==0.1.8
