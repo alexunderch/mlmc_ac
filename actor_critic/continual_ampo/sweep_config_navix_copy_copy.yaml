@@ -6,22 +6,26 @@ metric:
   name: Episode_Return
 
 parameters:
+  # learning_rate:
+  #   values: [0.99]
   experiment.num_envs:
-    values: [2]
+    values: [8]
   experiment.gae_lambda: 
     values: [0.95] 
   experiment.batchsize_bound: 
-    values: [64]
+    values: [2, 16]
   experiment.batchsize_limit: 
-    values: [4]
+    values: [2, 32]
+  experiment.projection: 
+    values: ["simplex", "l2"]
   experiment.env_id:
     values: [navix:Navix-Empty-5x5-v0]
   optimiser:
-    values: [adam, mamd, sf_sgd, prodigy]
+    values: [adam]
   experiment.mlmc_correction:
-    values: [true, false]
+    values: [true]
   seed:
-    values: [0, 1, 10, 11, 100]
+    values: [0, 1, 10]
 
 command:
 - ${env}

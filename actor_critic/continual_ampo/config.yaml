@@ -1,7 +1,6 @@
 seed: 0
-optimiser: adam
+optimiser: mamd
 critic_optimiser: adam
-
 
 momentum:
   decay_theta: 0.87
@@ -17,17 +16,17 @@ experiment:
   env_id: navix:Navix-Empty-5x5-v0 #navix:Navix-Empty-8x8-v0  #"navix:Navix-DoorKey-5x5-v0" # navix:Navix-Empty-8x8-v0 #CartPole-v1
   num_envs: 2
   n_training_episodes: 1000000
-  batchsize_bound: 128
-  max_t: 500
-  batchsize_limit: 32
+  batchsize_bound: 4
+  num_minibatches: 2
+  batchsize_limit: 128
   gae_lambda: 0.95
-  vf_coeff: 1.0
+  vf_coeff: 0.5
   clip_eps: 0.2
   ent_coeff: 0.01
-  av_vf_coeff: 0.1
+  av_vf_coeff: 0.01
   mlmc_correction: true
   total_samples: 1000000
-
+  projection: simplex
 
 wandb:
   project: MLMCOptimiser 

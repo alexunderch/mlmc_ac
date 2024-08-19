@@ -6,22 +6,26 @@ metric:
   name: Episode_Return
 
 parameters:
+  experiment.projection: 
+    values: ["simplex", "l2"] #["softmax", "simplex"]
   experiment.num_envs:
-    values: [2]
+    values: [8]
   experiment.gae_lambda: 
     values: [0.95] 
   experiment.batchsize_bound: 
-    values: [64]
+    values: [2, 16]
   experiment.batchsize_limit: 
-    values: [4]
+    values: [2, 32]
+  experiment.total_samples: 
+    values: [100000]
   experiment.env_id:
-    values: [navix:Navix-Empty-5x5-v0]
+    values: [CartPole-v1, Acrobot-v1] 
   optimiser:
-    values: [adam, mamd, sf_sgd, prodigy]
+    values: [adam, mamd]
   experiment.mlmc_correction:
     values: [true, false]
   seed:
-    values: [0, 1, 10, 11, 100]
+    values: [0, 1, 10]
 
 command:
 - ${env}

@@ -68,7 +68,9 @@ class NavixGymnaxWrapper:
 class Transition(NamedTuple):
     observation: jnp.ndarray
     action: jnp.ndarray
+    policy_logits: jnp.ndarray
     log_prob: jnp.ndarray
+    proj_lambdas: jnp.ndarray
     reward: jnp.ndarray
     value: jnp.ndarray
     done: jnp.ndarray
@@ -169,14 +171,80 @@ def accelerated_mgd(
     return base.GradientTransformation(init_fn, update_fn)
 
 
+@jax.custom_jvp
+def _projection_unit_simplex(x: jnp.ndarray) -> jnp.ndarray:
+    """Projection onto the unit simplex."""
+
+    s = 1.0
+    n_features = x.shape[0]
+    u = jnp.sort(x)[::-1]
+    cumsum_u = jnp.cumsum(u)
+    ind = jnp.arange(n_features) + 1
+    cond = s / ind + (u - cumsum_u / ind) > 0
+    idx = jnp.count_nonzero(cond)
+    return nn.relu(s / idx + (x - cumsum_u[idx - 1] / idx))
+
+
+@_projection_unit_simplex.defjvp
+def _projection_unit_simplex_jvp(primals, tangents):
+    (x, ) = primals
+    (x_dot, ) = tangents
+    primal_out = _projection_unit_simplex(x)
+    supp = primal_out > 0
+    card = jnp.count_nonzero(supp)
+    tangent_out = jnp.dot(jnp.diag(supp) - jnp.outer(supp, supp) / card, x_dot)
+    return primal_out, tangent_out
+
+
+def _projection_simplex(x: jnp.ndarray, value: float = 1.0) -> jnp.ndarray:
+    r"""Projection onto a simplex:
+
+    .. math::
+
+    \underset{p}{\text{argmin}} ~ ||x - p||_2^2 \quad \textrm{subject to} \quad
+    p \ge 0, p^\top 1 = \text{value}
+
+    By default, the projection is onto the probability simplex.
+
+    Args:
+    x: vector to project, an array of shape (n,).
+    value: value p should sum to (default: 1.0).
+    Returns:
+    projected vector, an array with the same shape as ``x``.
+    """
+    if value is None:
+        value = 1.0
+
+    proj = _projection_unit_simplex(jnp.exp(x) / value)
+    return value * proj
+
+def projection_simplex(
+        x: jnp.ndarray, num_actions: int, 
+        phi, phi_inv
+    ):
+    a = phi_inv(1)
+    b = phi_inv(1 / num_actions)
+    nu1 = a - jnp.max(x)
+    nu2 = b - jnp.max(x)
+    for i in range(10):
+        nu = (nu1 + nu2) / 2
+        cond = jnp.sum(nn.relu(phi(x + nu))) > 1
+        nu1 = jnp.where(cond, nu, nu1)
+        nu2 = jnp.where(1.0 - cond, nu, nu2)
+    projected_x = nn.relu(phi(x + nu1))
+    projected_x = projected_x / jnp.sum(projected_x)
+    return projected_x, nu1
+
+
+
 def run_actorcritic_experiment_mdpo(
     env_id: str,
     num_envs: int,
+    num_minibatches: int,
     optimiser: optax.GradientTransformation,
     critic_optimiser: optax.GradientTransformation,
     av_tracker_optimiser: optax.GradientTransformation,
     n_training_episodes: int,
-    max_t: int,
     gae_lambda: float,
     vf_coeff: float,
     ent_coeff: float,
@@ -186,9 +254,19 @@ def run_actorcritic_experiment_mdpo(
     batchsize_bound: int,
     batchsize_limit: int,
     mlmc_correction: bool,
+    projection: Optional[str] = "simplex",
     total_samples: Optional[int] = None,
-    mixing_parameters_param: Optional[bool] = False,
+    normalise_advantages: Optional[bool] = True,
+    mixing_parameters_param: Optional[bool] = False
 ):
+    
+    if projection == "simplex":
+        phi = lambda x: jnp.exp(x - 1)
+        phi_inv = lambda x: jnp.log(x) + 1
+    else:
+        phi = lambda x: x
+        phi_inv = lambda x: x
+
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
@@ -203,17 +281,28 @@ def run_actorcritic_experiment_mdpo(
     stopping_criterium = lambda k: k > total_samples
 
     @jax.jit
-    def _act_cat(policy_state, observations, key):
+    def _act_smplx(policy_state, observations, key):
         action_logits = jax.vmap(policy_state.apply_fn, in_axes=(None, 0))(
             {"params": policy_state.params}, observations
         )
+        lr_actor = jnp.where(
+            mixing_parameters_param,
+            1e-3 * (policy_state.step/2. + 1),
+            1.0
+        )
+        action_logits *= lr_actor
 
-        pi = Categorical(logits=action_logits)
-        action = pi.sample(seed=key)
-        log_prob = pi.log_prob(action.squeeze())
-        return action, log_prob
+        probs, lambda_ = jax.vmap(projection_simplex, in_axes=(0, None, None, None))(
+            action_logits, 
+            policy_network.num_actions,
+            phi, phi_inv
+        )
+        pi = Categorical(probs=probs)
+        action, log_prob = pi.sample_and_log_prob(seed=key)
 
-    act = _act_cat
+        return action, action_logits, log_prob, lambda_
+    act = _act_smplx
+
 
     @jax.jit
     def value(critic_state, observations):
@@ -237,7 +326,7 @@ def run_actorcritic_experiment_mdpo(
             env_step_key, act_key, key = jax.random.split(step_key, 3)
             state = jnp.reshape(state, (num_envs, -1))
             env_step_keys = jax.random.split(env_step_key, num_envs)
-            action, log_prob = act(policy_state, state, act_key)
+            action, policy_logits, log_prob, plambda = act(policy_state, state, act_key)
             value_ = value(critic_state, state)
             next_state, new_env_state, reward, done, info = jit_step(
                 env_step_keys, env_state, action, env_params
@@ -252,10 +341,10 @@ def run_actorcritic_experiment_mdpo(
                     critic_state,
                     ep_len + (1 - done.any().astype(jnp.int32)),
                 ),
-                Transition(state, action, log_prob, reward, value_, done, info),
+                Transition(state, action, policy_logits, log_prob, plambda, reward, value_, done, info),
             )
 
-    elif "pogema" not in env_id:
+    else:
         metrics_key = "Nil"
         env, env_params = gymnax.make(env_id)
         env = gymnax.wrappers.LogWrapper(env)
@@ -267,7 +356,7 @@ def run_actorcritic_experiment_mdpo(
             state, env_state, env_params, step_key, policy_state, critic_state, ep_len = carry
             env_step_key, act_key, key = jax.random.split(step_key, 3)
             env_step_keys = jax.random.split(env_step_key, num_envs)
-            action, log_prob = act(policy_state, state, act_key)
+            action, policy_logits, log_prob, plambda = act(policy_state, state, act_key)
             value_ = value(critic_state, state)
             next_state, new_env_state, reward, done, info = jit_step(
                 env_step_keys, env_state, action, env_params
@@ -282,7 +371,7 @@ def run_actorcritic_experiment_mdpo(
                     critic_state,
                     ep_len + (1 - done.any().astype(jnp.int32)),
                 ),
-                Transition(state, action, log_prob, reward, value_, done, info),
+                Transition(state, action, policy_logits, log_prob, plambda, reward, value_, done, info),
             )
 
     class Policy(nn.Module):
@@ -334,21 +423,18 @@ def run_actorcritic_experiment_mdpo(
             return (
                 self.param(
                     "tracked_reward",
-                    lambda rng, shape: jnp.zeros(shape),
+                    lambda rng, shape: jnp.zeros(shape, dtype=jnp.float32),
                     (self.output_dim,),
                 ),
                 self.param(
                     "tracked_value",
-                    lambda rng, shape: jnp.zeros(shape),
+                    lambda rng, shape: jnp.zeros(shape, dtype=jnp.float32),
                     (self.output_dim,),
                 ),
             )
 
     av_tracker = Tracker(1)
-    policy_network = Policy(
-        env.num_actions if "pogema" not in env_id else env.action_space.n
-    )
-
+    policy_network = Policy(env.num_actions)
     critic_network = Critic()
 
     init_policy_key, init_critic_key, init_reward_key, reset_key, key = jax.random.split(
@@ -398,38 +484,63 @@ def run_actorcritic_experiment_mdpo(
         )
         return advantages, advantages + traj_batch.value
 
-    def _actor_loss_fn(params, temperature, traj_batch, gae):
+    def _actor_loss_fn(params, traj_batch, gae):
+        lr_actor = jnp.where(
+            mixing_parameters_param,
+            1e-3 * ((policy_state.step - 500.01 * int(not mlmc_correction))/2. + 1),
+            1.0
+        )
+        previous_lr_actor = jnp.where(
+            mixing_parameters_param,
+             max(1e-3 * (1.0 + (policy_state.step-1. - 500.01 * int(not mlmc_correction))/2.), 1.0),
+            1.0
+        )
+        
+        
         # GRAIDENT OPTIMISATION PART
         # RERUN NETWORK
         action_logits = jax.vmap(policy_state.apply_fn, in_axes=(None, 0))(
             {"params": params}, traj_batch.observation
         )
+        probs, _ = jax.vmap(projection_simplex, in_axes=(0, None, None, None))(
+            action_logits, 
+            policy_network.num_actions,
+            phi, phi_inv
+        )
 
-
-        pi = Categorical(logits=action_logits)
-
-        log_prob = pi.log_prob(traj_batch.action.squeeze(-1))
+        pi = Categorical(probs=probs * lr_actor)
         entropy = pi.entropy()
+        log_prob = pi.log_prob(traj_batch.action.squeeze(-1))
 
         # CALCULATE ACTOR LOSS
         logratio = log_prob - traj_batch.log_prob.squeeze(-1)
-        ratio = jnp.exp(logratio)
-        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-        
-        _loss_actor = -ratio * gae - (1 - temperature/n_training_episodes) * logratio
-        # loss_actor2 = (
-        #     jnp.clip(
-        #         ratio,
-        #         1.0 - clip_eps,
-        #         1.0 + clip_eps,
-        #     )
-        #     * gae
-        # )
-        # _loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-        loss_actor = _loss_actor - ent_coeff * entropy
-        loss_actor = loss_actor.mean()
+        action_logits = action_logits[
+            jnp.arange(len(action_logits)), traj_batch.action
+        ]
 
-        return loss_actor, (_loss_actor.mean(), entropy, logratio.sum())
+        # CALCULATE ACTOR LOSS
+        gae = jnp.where(
+            normalise_advantages,
+            (gae - gae.mean()) / (gae.std() + 1e-8),
+            gae,
+        )
+
+
+        ############################################################        
+        preproj = traj_batch.policy_logits * (previous_lr_actor / lr_actor)
+        preproj = (
+            preproj[jnp.arange(len(preproj)), traj_batch.action] 
+             + jnp.squeeze(traj_batch.proj_lambdas)
+        )
+
+        objective = gae + jax.lax.stop_gradient(jnp.maximum(preproj, phi_inv(1e-6)) 
+        ) 
+
+        loss_actor = optax.l2_loss(action_logits, objective).mean() - ent_coeff * entropy.mean()
+        ############################################################        
+
+
+        return loss_actor, (loss_actor, entropy.mean(), logratio.mean())
     
     def _critic_loss_fn(params, traj_batch, targets, av_value):
         # GRAIDENT OPTIMISATION PART
@@ -447,7 +558,7 @@ def run_actorcritic_experiment_mdpo(
 
         value_losses = jnp.square(value - targets)
         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-        value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+        value_loss = jnp.maximum(value_losses, value_losses_clipped).mean()
 
         total_loss = vf_coeff * value_loss 
         return total_loss, (value_loss, )
@@ -488,7 +599,7 @@ def run_actorcritic_experiment_mdpo(
         )
 
         reward_tracker_grad_fn = jax.value_and_grad(
-            _av_reward_tracker_loss_fn, has_aux=True
+            _av_reward_tracker_loss_fn, has_aux=True,
         )
 
         def mix_params(train_state: TrainState):
@@ -501,6 +612,7 @@ def run_actorcritic_experiment_mdpo(
                     optax.tree_utils.tree_scalar_mul(1. - beta, x_f),                    
                 )
             return x_f
+
 
         if mlmc_correction:
             # truncated geometric distribution
@@ -519,6 +631,8 @@ def run_actorcritic_experiment_mdpo(
                 jnp.ceil((2 ** (J - 1)) * batchsize_bound)
             )
 
+            batchsize = J_t if 2**J <= batchsize_limit else batchsize_bound
+
             (observation, env_state, env_params, key, policy_state, critic_state, _), traj_batch = (
                 jax.lax.scan(
                     step_fn,
@@ -532,7 +646,7 @@ def run_actorcritic_experiment_mdpo(
                         jnp.array(0),
                     ),
                     xs=None,
-                    length=J_t if 2**J <= batchsize_limit else batchsize_bound,
+                    length=batchsize,
                     unroll=False,
                 )
             )
@@ -542,14 +656,13 @@ def run_actorcritic_experiment_mdpo(
                 traj_batch.reward,
                 traj_batch.value,
             )
-
+            
             last_obs = observation if (2**J <= batchsize_limit) else traj_batch.observation[batchsize_bound-1]
             last_val = value(critic_state, last_obs.reshape((num_envs, -1)))
             advantages, targets = _calculate_gae(traj_batch, last_val, av_reward)
 
             (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
                 mix_params(policy_state),
-                policy_state.step,
                 jax.tree.map(lambda x: x[:batchsize_bound].reshape((num_envs * batchsize_bound, -1)), traj_batch),
                 advantages[:batchsize_bound].reshape(-1),
             ) #0
@@ -566,13 +679,12 @@ def run_actorcritic_experiment_mdpo(
             if 2**J <= batchsize_limit:
                 sample_counter += J_t * num_envs
 
-                (_, (av_reward_t, av_value_t)), tracker_grads_t = reward_tracker_grad_fn(
+                _, tracker_grads_t = reward_tracker_grad_fn(
                     tracker_state.params, traj_batch.reward, traj_batch.value
                 )
 
                 _, actor_grads_t = actor_loss_grad_fn(
                     mix_params(policy_state),
-                    policy_state.step,
                     jax.tree.map(lambda x: x.reshape((num_envs * J_t, -1)), traj_batch),
                     advantages.reshape((J_t * num_envs, -1)),
                 ) #t
@@ -593,7 +705,6 @@ def run_actorcritic_experiment_mdpo(
 
                 _, actor_grads_tm1 = actor_loss_grad_fn(
                     mix_params(policy_state),
-                    policy_state.step,
                     jax.tree.map(lambda x: x[:J_tm1].reshape((num_envs * J_tm1, -1)), traj_batch),
                     advantages[:J_tm1].reshape(-1),
                 ) #0
@@ -607,7 +718,7 @@ def run_actorcritic_experiment_mdpo(
                 ) #tm1
 
                 actor_grads = jax.tree.map(
-                    lambda g, x, y: g - (2**J) * (x - y),
+                    lambda g, x, y: g +(2**J) * (x - y),
                     actor_grads,
                     actor_grads_t,
                     actor_grads_tm1,
@@ -665,7 +776,6 @@ def run_actorcritic_experiment_mdpo(
 
             (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
                 mix_params(policy_state),
-                policy_state.step,
                 traj_batch,
                 advantages,
             )
@@ -789,9 +899,8 @@ def main(cfg: DictConfig) -> None:
     # Scale updates by -1 since optax.apply_updates is additive and we want to descend on the loss.
     optax.scale(-1.0)
 )
-    
     optimisers = {
-        "mamd": accelerated_mgd(learning_rate=dict_config["learning_rate"]/100, mlmc_correction=dict_config["experiment"]["mlmc_correction"]),
+        "mamd": accelerated_mgd(learning_rate=dict_config["learning_rate"], mlmc_correction=dict_config["experiment"]["mlmc_correction"]),
         "sgd": optax.sgd(learning_rate=dict_config["learning_rate"]),
         "adagrad": optax.adagrad(learning_rate=dict_config["learning_rate"]),
         "adam": adam_opt, #optax.adam(learning_rate=dict_config["learning_rate"]),
@@ -811,16 +920,16 @@ def main(cfg: DictConfig) -> None:
     }
 
     tracker_optimisers = {
-        "mamd": accelerated_mgd(learning_rate=dict_config["learning_rate"], mlmc_correction=dict_config["experiment"]["mlmc_correction"]),
+        "mamd": accelerated_mgd(learning_rate=dict_config["alpha"], mlmc_correction=dict_config["experiment"]["mlmc_correction"]),
         "sgd": optax.sgd(learning_rate=dict_config["alpha"]),
         "adagrad": optax.adagrad(learning_rate=dict_config["alpha"]),
         # "adam": optax.adam(learning_rate=optax.exponential_decay(dict_config["alpha"], dict_config["experiment"]["n_training_episodes"], 0.99, 1)),
-        "adam": adam_opt, #optax.adam(learning_rate=dict_config["alpha"]),
+        "adam": optax.adam(learning_rate=dict_config["alpha"]),
         "adamw": optax.adamw(learning_rate=dict_config["alpha"]),
-        "prodigy": prodigy(learning_rate=dict_config["learning_rate"]),
+        "prodigy": prodigy(learning_rate=dict_config["alpha"]),
         "sf_mamd": schedule_free(accelerated_mgd(learning_rate=1.0, mlmc_correction=dict_config["experiment"]["mlmc_correction"]), dict_config["learning_rate"]),
-        "sf_sgd": schedule_free_sgd(learning_rate=dict_config["learning_rate"]),
-        "sf_adamw": schedule_free_adamw(learning_rate=dict_config["learning_rate"]),
+        "sf_sgd": schedule_free_sgd(learning_rate=dict_config["alpha"]),
+        "sf_adamw": schedule_free_adamw(learning_rate=dict_config["alpha"]),
         # "accelerated_sgd": accelerated_trace(
         #     learning_rate=lambda t: dict_config["alpha"], **dict_config["momentum"]
         # ),
@@ -832,13 +941,14 @@ def main(cfg: DictConfig) -> None:
         # ),
     }
 
+
     opt = optax.chain(
         optax.clip_by_global_norm(0.5), optimisers[dict_config["optimiser"]]
     )
 
 
     critic_opt = optax.chain(
-        optax.clip_by_global_norm(0.5), optimisers[dict_config["critic_optimiser"]]
+        optax.clip_by_global_norm(0.5), tracker_optimisers[dict_config["critic_optimiser"]]
     )
 
     opt_tracker = optax.chain(
@@ -852,7 +962,6 @@ def main(cfg: DictConfig) -> None:
         seed=dict_config["seed"],
         mixing_parameters_param="mamd" in dict_config["optimiser"]
     )
-
 
 
 if __name__ == "__main__":

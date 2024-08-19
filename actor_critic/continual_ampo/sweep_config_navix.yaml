@@ -11,9 +11,9 @@ parameters:
   experiment.gae_lambda: 
     values: [0.95] 
   experiment.batchsize_bound: 
-    values: [64]
+    values: [2]
   experiment.batchsize_limit: 
-    values: [4]
+    values: [64]
   experiment.env_id:
     values: [navix:Navix-Empty-5x5-v0]
   optimiser:
