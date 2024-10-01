@@ -1,14 +1,14 @@
-import functools
 import warnings
+import functools
 from collections import deque
-from typing import Any,  Literal, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
+from jaxmarl.environments.jaxnav import JaxNav
 import gymnax
 import gymnax.wrappers
 import hydra
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import navix as nx
 import numpy as np
 import optax
@@ -23,7 +23,6 @@ from optax.contrib import (
 import wandb
 from distrax import Categorical
 from flax import linen as nn
-from flax.struct import dataclass
 from flax.training.train_state import TrainState
 from gymnax.environments import spaces
 from omegaconf import DictConfig, OmegaConf
@@ -34,6 +33,35 @@ warnings.filterwarnings("ignore")
 
 DEBUG_POGEMA = False
 
+
+class JaxNavGymnaxWrapper:
+    def __init__(self, env_name = "") -> None:
+        self._env = JaxNav(num_agents=1, act_type="Discrete")
+    
+    def reset(self, key, params=None):
+        timestep, env_state = self._env.reset(key)
+        return timestep['agent_0'], env_state
+
+    def step(self, key, state, action, params=None):
+        observation, env_state, reward, is_done, info = self._env.step(key, state, {"agent_0": action})
+        return observation["agent_0"], env_state, reward["agent_0"], is_done["agent_0"], info
+
+    def observation_space(self, params):
+        return spaces.Box(
+            low=self._env.observation_space("agent_0").low,
+            high=self._env.observation_space("agent_0").high,
+            shape=(np.prod(self._env.observation_space("agent_0").shape),),
+            dtype=self._env.observation_space("agent_0").dtype,
+        )
+
+    def action_space(self, params):
+        return spaces.Discrete(
+            num_categories=self._env.action_space('agent_0').n,
+        )
+
+    @property
+    def num_actions(self):
+        return self._env.action_space('agent_0').n
 
 class NavixGymnaxWrapper:
     def __init__(self, env_name):
@@ -82,56 +110,6 @@ class AcceleratedTraceState(NamedTuple):
     count: jax.Array  # shape=(), dtype=jnp.int32.
     trace: base.Params
 
-
-# def accelerated_trace(
-#     learning_rate: float,
-#     decay_theta: float,
-#     decay_eta: float,
-#     decay_beta: float,
-#     decay_p: float,
-#     accumulator_dtype: Optional[Any] = None,
-# ) -> base.GradientTransformation:
-
-#     accumulator_dtype = utils.canonicalize_dtype(accumulator_dtype)
-
-#     def init_fn(params):
-#         return AcceleratedTraceState(
-#             count=jnp.zeros((), dtype=jnp.int32), trace_f=params
-#         )
-
-#     def update_fn(updates, state, params):
-#         count = state.count
-#         mul_by_alpha = lambda alpha, x: jax.tree_util.tree_map(lambda y: alpha * y, x)
-
-#         trace_g = jax.tree_util.tree_map(
-#             lambda x, x_f: mul_by_alpha(decay_theta, x_f)
-#             + mul_by_alpha(1.0 - decay_theta, x),
-#             params,
-#             state.trace_f,
-#         )
-
-#         trace_f_update_fn = lambda g, t: t - decay_p * learning_rate(count) * g
-#         new_trace_f = jax.tree_util.tree_map(trace_f_update_fn, updates, trace_g)
-
-#         updates = jax.tree_util.tree_map(
-#             lambda x, x_f, next_x_f, x_g: (
-#                 +mul_by_alpha(decay_eta, next_x_f)
-#                 + mul_by_alpha(decay_p - decay_eta, x_f)
-#                 + mul_by_alpha((1.0 - decay_p) * (1.0 - decay_beta) - 1.0, x)
-#                 + mul_by_alpha((1.0 - decay_p) * decay_beta, x_g)
-#             ),
-#             params,
-#             state.trace_f,
-#             new_trace_f,
-#             trace_g,
-#         )
-#         new_trace_f = utils.cast_tree(new_trace_f, accumulator_dtype)
-
-#         return updates, AcceleratedTraceState(trace_f=new_trace_f, count=count + 1)
-
-#     return base.GradientTransformation(init_fn, update_fn)
-
-
 def accelerated_mgd(
     learning_rate: float,
     mlmc_correction: bool,
@@ -148,7 +126,7 @@ def accelerated_mgd(
 
     def update_fn(updates, state, params):
         count = state.count
-        mul_by_alpha = lambda alpha, x: jax.tree_util.tree_map(lambda y: alpha * y, x)
+        mul_by_alpha = lambda alpha, x: jax.tree_util.tree_map(lambda y: alpha * y, x) # noqa: E731
 
         beta_t = momentum / (1 + (count - 500.01 * int(not mlmc_correction)) / 2.)
         gamma_t = 1 + (count - 500.01 * int(not mlmc_correction)) / 2.
@@ -218,19 +196,33 @@ def _projection_simplex(x: jnp.ndarray, value: float = 1.0) -> jnp.ndarray:
     proj = _projection_unit_simplex(jnp.exp(x) / value)
     return value * proj
 
+
+@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
 def projection_simplex(
         x: jnp.ndarray, num_actions: int, 
-        phi, phi_inv
+        phi, phi_inv, 
+        precision: jnp.array,
     ):
     a = phi_inv(1)
     b = phi_inv(1 / num_actions)
     nu1 = a - jnp.max(x)
     nu2 = b - jnp.max(x)
-    for i in range(10):
+
+    def _binary_search(iter, val):
+        nu1, nu2, x = val
         nu = (nu1 + nu2) / 2
-        cond = jnp.sum(nn.relu(phi(x + nu))) > 1
+        cond = jnp.sum(nn.relu(phi(x + nu))) > 1.0
         nu1 = jnp.where(cond, nu, nu1)
         nu2 = jnp.where(1.0 - cond, nu, nu2)
+        return (nu1, nu2, x)
+
+    (nu1, nu2, x) = jax.lax.fori_loop(
+        lower=0,
+        upper=10, 
+        body_fun=_binary_search,
+        init_val=(nu1, nu2, x)
+    )
+
     projected_x = nn.relu(phi(x + nu1))
     projected_x = projected_x / jnp.sum(projected_x)
     return projected_x, nu1
@@ -240,7 +232,6 @@ def projection_simplex(
 def run_actorcritic_experiment_mdpo(
     env_id: str,
     num_envs: int,
-    num_minibatches: int,
     optimiser: optax.GradientTransformation,
     critic_optimiser: optax.GradientTransformation,
     av_tracker_optimiser: optax.GradientTransformation,
@@ -261,12 +252,13 @@ def run_actorcritic_experiment_mdpo(
 ):
     
     if projection == "simplex":
-        phi = lambda x: jnp.exp(x - 1)
-        phi_inv = lambda x: jnp.log(x) + 1
+        phi = lambda x: jnp.exp(x - 1)  # noqa: E731
+        phi_inv = lambda x: jnp.log(x) + 1  # noqa: E731
     else:
-        phi = lambda x: x
-        phi_inv = lambda x: x
-
+        phi = lambda x: x  # noqa: E731
+        phi_inv = lambda x: x   # noqa: E731
+    precision = 0.001
+    
     scores_deque = deque(maxlen=100)
     lengths_deque = deque(maxlen=100)
     metrics_deque = deque(maxlen=100)
@@ -278,7 +270,7 @@ def run_actorcritic_experiment_mdpo(
     )
 
     sample_counter: int = 0
-    stopping_criterium = lambda k: k > total_samples
+    stopping_criterium = lambda k: k > total_samples # noqa: E731
 
     @jax.jit
     def _act_smplx(policy_state, observations, key):
@@ -292,10 +284,10 @@ def run_actorcritic_experiment_mdpo(
         )
         action_logits *= lr_actor
 
-        probs, lambda_ = jax.vmap(projection_simplex, in_axes=(0, None, None, None))(
+        probs, lambda_ = jax.vmap(projection_simplex, in_axes=(0, None, None, None, None))(
             action_logits, 
             policy_network.num_actions,
-            phi, phi_inv
+            phi, phi_inv, precision
         )
         pi = Categorical(probs=probs)
         action, log_prob = pi.sample_and_log_prob(seed=key)
@@ -312,10 +304,14 @@ def run_actorcritic_experiment_mdpo(
         )
         return value
 
-    if "navix" in env_id:
+    if "navix" in env_id or "jaxnav" in env_id:
         metrics_key = "Nil"
-        _, env_name = env_id.split(":")
-        env, env_params = NavixGymnaxWrapper(env_name), None
+        if "navix" in env_id:
+            _, env_name = env_id.split(":")
+            env, env_params = NavixGymnaxWrapper(env_name), None
+        elif "jaxnav" in env_id:
+            env, env_params = JaxNavGymnaxWrapper(), None
+            
         env = gymnax.wrappers.LogWrapper(env)
 
         jit_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, None)))
@@ -502,10 +498,10 @@ def run_actorcritic_experiment_mdpo(
         action_logits = jax.vmap(policy_state.apply_fn, in_axes=(None, 0))(
             {"params": params}, traj_batch.observation
         )
-        probs, _ = jax.vmap(projection_simplex, in_axes=(0, None, None, None))(
+        probs, _ = jax.vmap(projection_simplex, in_axes=(0, None, None, None, None))(
             action_logits, 
             policy_network.num_actions,
-            phi, phi_inv
+            phi, phi_inv, precision
         )
 
         pi = Categorical(probs=probs * lr_actor)
@@ -536,7 +532,7 @@ def run_actorcritic_experiment_mdpo(
         objective = gae + jax.lax.stop_gradient(jnp.maximum(preproj, phi_inv(1e-6)) 
         ) 
 
-        loss_actor = optax.l2_loss(action_logits, objective).mean() - ent_coeff * entropy.mean()
+        loss_actor = optax.l2_loss(action_logits, objective).mean() 
         ############################################################        
 
 
@@ -549,12 +545,12 @@ def run_actorcritic_experiment_mdpo(
             {"params": params}, traj_batch.observation
         )
 
+        value = value - av_value * av_vf_coeff
+
         # CALCULATE VALUE LOSS
         value_pred_clipped = traj_batch.value.squeeze(-1) + (value - traj_batch.value).clip(
             -clip_eps, clip_eps
         )
-
-        value = value - av_value * av_vf_coeff
 
         value_losses = jnp.square(value - targets)
         value_losses_clipped = jnp.square(value_pred_clipped - targets)
@@ -653,11 +649,11 @@ def run_actorcritic_experiment_mdpo(
 
             (_, (av_reward, av_value)), tracker_grads = reward_tracker_grad_fn(
                 tracker_state.params,
-                traj_batch.reward,
-                traj_batch.value,
+                traj_batch.reward[:batchsize_bound],
+                traj_batch.value[:batchsize_bound],
             )
             
-            last_obs = observation if (2**J <= batchsize_limit) else traj_batch.observation[batchsize_bound-1]
+            last_obs = observation # if (2**J <= batchsize_limit) else traj_batch.observation[batchsize_bound-1]
             last_val = value(critic_state, last_obs.reshape((num_envs, -1)))
             advantages, targets = _calculate_gae(traj_batch, last_val, av_reward)
 
@@ -679,7 +675,7 @@ def run_actorcritic_experiment_mdpo(
             if 2**J <= batchsize_limit:
                 sample_counter += J_t * num_envs
 
-                _, tracker_grads_t = reward_tracker_grad_fn(
+                (_, (av_reward, av_value)), tracker_grads_t = reward_tracker_grad_fn(
                     tracker_state.params, traj_batch.reward, traj_batch.value
                 )
 

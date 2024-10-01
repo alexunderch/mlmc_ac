@@ -7,17 +7,17 @@ metric:
 
 parameters:
   experiment.num_envs:
-    values: [2]
+    values: [10]
   experiment.gae_lambda: 
     values: [0.95] 
   experiment.batchsize_bound: 
     values: [64]
   experiment.batchsize_limit: 
-    values: [4]
+    values: [16]
   experiment.env_id:
-    values: [navix:Navix-Empty-5x5-v0]
+    values: [jaxnav, navix:Navix-Empty-5x5-v0, navix:Navix-DoorKey-5x5-v0]
   optimiser:
-    values: [adam, mamd, sf_sgd, prodigy]
+    values: [adam, adamw, mamd]
   experiment.mlmc_correction:
     values: [true, false]
   seed:

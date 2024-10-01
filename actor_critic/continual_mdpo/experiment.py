@@ -1,8 +1,8 @@
-import functools
 import warnings
 from collections import deque
-from typing import Any,  Literal, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
+from jaxmarl.environments.jaxnav import JaxNav
 import gymnax
 import gymnax.wrappers
 import hydra
@@ -23,17 +23,44 @@ from optax.contrib import (
 import wandb
 from distrax import Categorical
 from flax import linen as nn
-from flax.struct import dataclass
 from flax.training.train_state import TrainState
 from gymnax.environments import spaces
 from omegaconf import DictConfig, OmegaConf
-
 
 warnings.filterwarnings("ignore")
 
 
 DEBUG_POGEMA = False
 
+
+class JaxNavGymnaxWrapper:
+    def __init__(self, env_name = "") -> None:
+        self._env = JaxNav(num_agents=1, act_type="Discrete")
+    
+    def reset(self, key, params=None):
+        timestep, env_state = self._env.reset(key)
+        return timestep['agent_0'], env_state
+
+    def step(self, key, state, action, params=None):
+        observation, env_state, reward, is_done, info = self._env.step(key, state, {"agent_0": action})
+        return observation["agent_0"], env_state, reward["agent_0"], is_done["agent_0"], info
+
+    def observation_space(self, params):
+        return spaces.Box(
+            low=self._env.observation_space("agent_0").low,
+            high=self._env.observation_space("agent_0").high,
+            shape=(np.prod(self._env.observation_space("agent_0").shape),),
+            dtype=self._env.observation_space("agent_0").dtype,
+        )
+
+    def action_space(self, params):
+        return spaces.Discrete(
+            num_categories=self._env.action_space('agent_0').n,
+        )
+
+    @property
+    def num_actions(self):
+        return self._env.action_space('agent_0').n
 
 class NavixGymnaxWrapper:
     def __init__(self, env_name):
@@ -185,7 +212,8 @@ def run_actorcritic_experiment_mdpo(
     seed: int,
     batchsize_bound: int,
     batchsize_limit: int,
-    mlmc_correction: bool,
+    mlmc_correction: bool, 
+    gd_epochs: Optional[int] = 5,
     total_samples: Optional[int] = None,
     mixing_parameters_param: Optional[bool] = False,
 ):
@@ -223,10 +251,14 @@ def run_actorcritic_experiment_mdpo(
         )
         return value
 
-    if "navix" in env_id:
+    if "navix" in env_id or "jaxnav" in env_id:
         metrics_key = "Nil"
-        _, env_name = env_id.split(":")
-        env, env_params = NavixGymnaxWrapper(env_name), None
+        if "navix" in env_id:
+            _, env_name = env_id.split(":")
+            env, env_params = NavixGymnaxWrapper(env_name), None
+        elif "jaxnav" in env_id:
+            env, env_params = JaxNavGymnaxWrapper(), None
+            
         env = gymnax.wrappers.LogWrapper(env)
 
         jit_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, None)))
@@ -474,7 +506,6 @@ def run_actorcritic_experiment_mdpo(
         rng,
         env_rng,
         sample_counter,
-        update_counter,
     ):
 
         actor_loss_grad_fn = jax.value_and_grad(
@@ -547,88 +578,92 @@ def run_actorcritic_experiment_mdpo(
             last_val = value(critic_state, last_obs.reshape((num_envs, -1)))
             advantages, targets = _calculate_gae(traj_batch, last_val, av_reward)
 
-            (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
-                mix_params(policy_state),
-                policy_state.step,
-                jax.tree.map(lambda x: x[:batchsize_bound].reshape((num_envs * batchsize_bound, -1)), traj_batch),
-                advantages[:batchsize_bound].reshape(-1),
-            ) #0
-
-
-            (critic_loss_value, (value_loss, )), critic_grads = critic_loss_grad_fn(
-                critic_state.params,
-                jax.tree.map(lambda x: x[:batchsize_bound].reshape((num_envs * batchsize_bound, -1)), traj_batch),
-                targets[:batchsize_bound].reshape(-1),
-                av_value[:batchsize_bound].reshape(-1),
-            ) #0
-
-            # mlmc batch_size
-            if 2**J <= batchsize_limit:
-                sample_counter += J_t * num_envs
-
-                (_, (av_reward_t, av_value_t)), tracker_grads_t = reward_tracker_grad_fn(
-                    tracker_state.params, traj_batch.reward, traj_batch.value
-                )
-
-                _, actor_grads_t = actor_loss_grad_fn(
+            for _ in range(gd_epochs):
+                
+                (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
                     mix_params(policy_state),
                     policy_state.step,
-                    jax.tree.map(lambda x: x.reshape((num_envs * J_t, -1)), traj_batch),
-                    advantages.reshape((J_t * num_envs, -1)),
-                ) #t
-
-
-                _, critic_grads_t = critic_loss_grad_fn(
-                    critic_state.params,
-                    jax.tree.map(lambda x: x.reshape((num_envs * J_t, -1)), traj_batch),
-                    targets.reshape((J_t * num_envs, -1)),
-                    av_value.reshape(-1),
-                ) #t
-
-                _, tracker_grads_tm1 = reward_tracker_grad_fn(
-                    tracker_state.params,
-                    traj_batch.reward[:J_tm1],
-                    traj_batch.value[:J_tm1],
-                )
-
-                _, actor_grads_tm1 = actor_loss_grad_fn(
-                    mix_params(policy_state),
-                    policy_state.step,
-                    jax.tree.map(lambda x: x[:J_tm1].reshape((num_envs * J_tm1, -1)), traj_batch),
-                    advantages[:J_tm1].reshape(-1),
+                    jax.tree.map(lambda x: x[:batchsize_bound].reshape((num_envs * batchsize_bound, -1)), traj_batch),
+                    advantages[:batchsize_bound].reshape(-1),
                 ) #0
 
 
-                _, critic_grads_tm1 = critic_loss_grad_fn(
+                (critic_loss_value, (value_loss, )), critic_grads = critic_loss_grad_fn(
                     critic_state.params,
-                    jax.tree.map(lambda x: x[:J_tm1].reshape((num_envs * J_tm1, -1)), traj_batch),
-                    targets[:J_tm1].reshape(-1),
-                    av_value[:J_tm1].reshape(-1),
-                ) #tm1
+                    jax.tree.map(lambda x: x[:batchsize_bound].reshape((num_envs * batchsize_bound, -1)), traj_batch),
+                    targets[:batchsize_bound].reshape(-1),
+                    av_value[:batchsize_bound].reshape(-1),
+                ) #0
 
-                actor_grads = jax.tree.map(
-                    lambda g, x, y: g - (2**J) * (x - y),
-                    actor_grads,
-                    actor_grads_t,
-                    actor_grads_tm1,
-                )
+                # mlmc batch_size
+                if 2**J <= batchsize_limit:
+                    sample_counter += (J_t * num_envs) // (gd_epochs + 1)
 
-                critic_grads = jax.tree.map(
-                    lambda g, x, y: g + (2**J) * (x - y),
-                    critic_grads,
-                    critic_grads_t,
-                    critic_grads_tm1,
-                )
+                    _, tracker_grads_t = reward_tracker_grad_fn(
+                        tracker_state.params, traj_batch.reward, traj_batch.value
+                    )
 
-                tracker_grads = jax.tree.map(
-                    lambda g, x, y: g + (2**J) * (x - y),
-                    tracker_grads,
-                    tracker_grads_t,
-                    tracker_grads_tm1,
-                )
+                    _, actor_grads_t = actor_loss_grad_fn(
+                        mix_params(policy_state),
+                        policy_state.step,
+                        jax.tree.map(lambda x: x.reshape((num_envs * J_t, -1)), traj_batch),
+                        advantages.reshape((J_t * num_envs, -1)),
+                    ) #t
 
-            else:
-                sample_counter += batchsize_bound * num_envs
+
+                    _, critic_grads_t = critic_loss_grad_fn(
+                        critic_state.params,
+                        jax.tree.map(lambda x: x.reshape((num_envs * J_t, -1)), traj_batch),
+                        targets.reshape((J_t * num_envs, -1)),
+                        av_value.reshape(-1),
+                    ) #t
+
+                    _, tracker_grads_tm1 = reward_tracker_grad_fn(
+                        tracker_state.params,
+                        traj_batch.reward[:J_tm1],
+                        traj_batch.value[:J_tm1],
+                    )
+
+                    _, actor_grads_tm1 = actor_loss_grad_fn(
+                        mix_params(policy_state),
+                        policy_state.step,
+                        jax.tree.map(lambda x: x[:J_tm1].reshape((num_envs * J_tm1, -1)), traj_batch),
+                        advantages[:J_tm1].reshape(-1),
+                    ) #0
+
+
+                    _, critic_grads_tm1 = critic_loss_grad_fn(
+                        critic_state.params,
+                        jax.tree.map(lambda x: x[:J_tm1].reshape((num_envs * J_tm1, -1)), traj_batch),
+                        targets[:J_tm1].reshape(-1),
+                        av_value[:J_tm1].reshape(-1),
+                    ) #tm1
+
+                    actor_grads = jax.tree.map(
+                        lambda g, x, y: g - (2**J) * (x - y),
+                        actor_grads,
+                        actor_grads_t,
+                        actor_grads_tm1,
+                    )
+
+                    critic_grads = jax.tree.map(
+                        lambda g, x, y: g + (2**J) * (x - y),
+                        critic_grads,
+                        critic_grads_t,
+                        critic_grads_tm1,
+                    )
+
+                    tracker_grads = jax.tree.map(
+                        lambda g, x, y: g + (2**J) * (x - y),
+                        tracker_grads,
+                        tracker_grads_t,
+                        tracker_grads_tm1,
+                    )
+                    policy_state = policy_state.apply_gradients(grads=actor_grads)
+                    critic_state = critic_state.apply_gradients(grads=critic_grads)
+                    tracker_state = tracker_state.apply_gradients(grads=tracker_grads)
+                else:
+                    sample_counter += (batchsize_bound * num_envs) // (gd_epochs+1)
         else:
             sample_counter += batchsize_bound * num_envs
 
@@ -663,24 +698,25 @@ def run_actorcritic_experiment_mdpo(
                 lambda x: jnp.reshape(x, (batchsize_bound * num_envs, -1)), (advantages, targets)
             )
 
-            (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
-                mix_params(policy_state),
-                policy_state.step,
-                traj_batch,
-                advantages,
-            )
+            for _ in range(gd_epochs):
 
-            (critic_loss_value, (value_loss, )), critic_grads = critic_loss_grad_fn(
-                critic_state.params,
-                traj_batch,
-                targets,
-                av_value.reshape(-1),
-            )
+                (actor_loss_value, (policy_loss, entropy, kl)), actor_grads = actor_loss_grad_fn(
+                    mix_params(policy_state),
+                    policy_state.step,
+                    traj_batch,
+                    advantages,
+                )
 
-        # jax.debug.print("{x}", x=grads)
-        policy_state = policy_state.apply_gradients(grads=actor_grads)
-        critic_state = critic_state.apply_gradients(grads=critic_grads)
-        tracker_state = tracker_state.apply_gradients(grads=tracker_grads)
+                (critic_loss_value, (value_loss, )), critic_grads = critic_loss_grad_fn(
+                    critic_state.params,
+                    traj_batch,
+                    targets,
+                    av_value.reshape(-1),
+                )
+
+                policy_state = policy_state.apply_gradients(grads=actor_grads)
+                critic_state = critic_state.apply_gradients(grads=critic_grads)
+                tracker_state = tracker_state.apply_gradients(grads=tracker_grads)
         
         actor_grad_norm = optax.global_norm(actor_grads)
         critc_grad_norm = optax.global_norm(critic_grads)
@@ -699,7 +735,6 @@ def run_actorcritic_experiment_mdpo(
         )
 
     state, env_state = jit_reset(jax.random.split(reset_key, num_envs), env_params)
-    update_counter = 0
     for i_episode in range(1, n_training_episodes + 1):
         loss_key, reset_key, step_key = jax.random.split(key, 3)
 
@@ -727,15 +762,12 @@ def run_actorcritic_experiment_mdpo(
             loss_key,
             step_key,
             sample_counter,
-            update_counter,
         )
 
         scores_deque.append(env_state.returned_episode_returns)
         lengths_deque.append(env_state.returned_episode_lengths)
         if "pogema" in env_id:
             metrics_deque.append(env_state.returned_episode_metrics)
-
-        update_counter += 1
 
         wandb.log(
             {
@@ -844,6 +876,7 @@ def main(cfg: DictConfig) -> None:
     opt_tracker = optax.chain(
         optax.clip_by_global_norm(0.5), tracker_optimisers[dict_config["critic_optimiser"]]
     )
+
     run_actorcritic_experiment_mdpo(
         optimiser=opt,
         critic_optimiser=critic_opt,
