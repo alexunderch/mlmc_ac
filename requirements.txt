@@ -1,8 +1,9 @@
-jax<0.4.26
-chex==0.1.86
+pufferlib
+jax
+chex
 distrax
-flax<0.8.3
-optax==0.1.8
+flax
+optax
 gymnax
 hydra-core
 pandas
@@ -12,6 +13,6 @@ wandb
 # pogema-toolbox
 # pydantic==1.9.1
 # typing-extensions==4.5.0
-numpy==1.26.4
+# numpy==1.26.4
 navix
 

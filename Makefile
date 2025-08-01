@@ -19,5 +19,8 @@ build:
 	DOCKER_BUILDKIT=1 docker build --build-arg USE_CUDA=$(USE_CUDA) --tag $(IMAGE) --progress=plain ${PWD}/.
 
 run:
-	$(DOCKER_RUN) /bin/bash 
+	# $(DOCKER_RUN) /bin/bash 
+	docker run -itd --gpus all --shm-size=32768m --name ${USER}-container-mlmc \
+		   --restart=always -v ${PWD}:/root -p 8183:8888 \
+		   ${USER}-base-image 
 

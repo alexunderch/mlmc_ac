@@ -1,0 +1,31 @@
+program: experiment_mdpo.py
+project: mamd
+
+method: grid
+metric:
+  goal: maximize
+  name: Episode_Return
+
+parameters:
+  experiment.num_envs:
+    values: [10]
+  experiment.batchsize_bound: 
+    values: [2, 64]
+  experiment.batchsize_limit: 
+    values: [2]
+  experiment.total_samples: 
+    values: [100000]
+  experiment.env_id:
+    values: [navix:Navix-Empty-6x6-v0, navix:Navix-LavaGapS6-v0, navix:Navix-Dynamic-Obstacles-6x6-v0, navix:Navix-GoToDoor-6x6-v0] 
+  optimiser:
+    values: [sgd]
+  experiment.mlmc_correction:
+    values: [false, true]
+  seed:
+    values: [0, 1, 10, 100]
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- ${args_no_hyphens}
